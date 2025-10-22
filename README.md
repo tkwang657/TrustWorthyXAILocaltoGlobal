@@ -1,1 +1,1 @@
-Project Repos for TrustWorthyXAILocaltoGlobal
+A project repository for TrustworthyAI local to global inference
