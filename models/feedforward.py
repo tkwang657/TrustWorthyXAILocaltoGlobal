@@ -11,6 +11,7 @@ import pandas as pd
 from typing import Tuple, Optional
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from tqdm import tqdm
+from sklearn.utils.class_weight import compute_class_weight
 
 
 class TabularDataset(Dataset):
@@ -58,6 +59,7 @@ class FeedForwardNN(nn.Module):
         
         self.network = nn.Sequential(*layers)
         
+        
     def forward(self, x):
         return self.network(x)
 
@@ -67,8 +69,7 @@ class FeedForwardModel:
     Wrapper class for training and using feed-forward neural networks.
     """
     
-    def __init__(self, 
-                 input_dim: int = None,
+    def __init__(self,
                  hidden_dims: list = [128, 64, 32], 
                  dropout: float = 0.3, 
                  learning_rate: float = 0.0005,
@@ -96,8 +97,7 @@ class FeedForwardModel:
               X_val=None, 
               y_val=None,
               epochs: int = 50, 
-              batch_size: int = 256, 
-              verbose: bool = True) -> dict:
+              batch_size: int = 256) -> dict:
         """
         Train the neural network.
         
@@ -128,15 +128,23 @@ class FeedForwardModel:
         ).to(self.device)
         
         # Loss and optimizer
-        criterion = nn.CrossEntropyLoss()
+        # weighting loss since theres WAY more of some classes than others in the dataset
+        classes = np.unique(y_train)  # keep 1–8
+        class_weights = compute_class_weight('balanced', classes=classes, y=y_train)
+        # Map class weights into tensor in the correct order
+        weight_tensor = torch.zeros(len(classes), dtype=torch.float32)
+        for i, cls in enumerate(classes):
+            weight_tensor[i] = class_weights[i]
+        weight_tensor = weight_tensor.to(self.device)
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
         optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         
         # Data loaders
         train_dataset = TabularDataset(X_train, y_train)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
         if X_val is not None and y_val is not None:
             val_dataset = TabularDataset(X_val, y_val)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
         # Training loop
         history = {'train_loss': [], 'val_loss': [], 'val_acc': [], 'val_f1': []}
@@ -158,7 +166,7 @@ class FeedForwardModel:
                 loss = criterion(outputs, batch_y)
                 
                 loss.backward()
-                
+
                 optimizer.step()
                 
                 train_loss += loss.item()
