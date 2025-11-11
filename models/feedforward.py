@@ -7,16 +7,27 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
+import pandas as pd
 from typing import Tuple, Optional
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from tqdm import tqdm
 
 
 class TabularDataset(Dataset):
-    """PyTorch dataset for tabular data."""
+    """PyTorch dataset for the pandas data"""
     
     def __init__(self, X, y):
-        self.X = torch.FloatTensor(X.values if hasattr(X, 'values') else X)
-        self.y = torch.FloatTensor(y.values if hasattr(y, 'values') else y)
+
+        # Convert to numpy array first for validation
+        X_data = X.values if hasattr(X, 'values') else X
+        if isinstance(X_data, pd.DataFrame):
+            X_data = X_data.values
+         
+        self.X = torch.FloatTensor(X_data)
+
+        y_data = y.values if hasattr(y, 'values') else y
+        y_data = np.array(y_data).astype(np.int64)
+        self.y = torch.LongTensor(y_data)
         
     def __len__(self):
         return len(self.X)
@@ -30,9 +41,8 @@ class FeedForwardNN(nn.Module):
     Basic feed-forward neural network with dropout for tabular data.
     """
     
-    def __init__(self, input_dim: int, hidden_dims: list = [128, 64, 32], 
-                 num_classes: int = 1, dropout: float = 0.3):
-        super(FeedForwardNN, self).__init__()
+    def __init__(self, input_dim: int, hidden_dims: list = [128, 64, 32], num_classes: int = 1, dropout: float = 0.3):
+        super().__init__()
         
         layers = []
         prev_dim = input_dim
@@ -44,12 +54,7 @@ class FeedForwardNN(nn.Module):
             layers.append(nn.Dropout(dropout))
             prev_dim = hidden_dim
         
-        # Output layer
-        if num_classes == 1:
-            layers.append(nn.Linear(prev_dim, 1))
-            layers.append(nn.Sigmoid())
-        else:
-            layers.append(nn.Linear(prev_dim, num_classes))
+        layers.append(nn.Linear(prev_dim, num_classes if num_classes > 1 else 1))
         
         self.network = nn.Sequential(*layers)
         
@@ -62,8 +67,11 @@ class FeedForwardModel:
     Wrapper class for training and using feed-forward neural networks.
     """
     
-    def __init__(self, hidden_dims: list = [128, 64, 32], 
-                 dropout: float = 0.3, learning_rate: float = 0.001,
+    def __init__(self, 
+                 input_dim: int = None,
+                 hidden_dims: list = [128, 64, 32], 
+                 dropout: float = 0.3, 
+                 learning_rate: float = 0.0005,
                  device: Optional[str] = None):
         """
         Initialize the model.
@@ -80,9 +88,15 @@ class FeedForwardModel:
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = None
         self.input_dim = None
+        self.num_classes = None
         
-    def train(self, X_train, y_train, X_val=None, y_val=None,
-              epochs: int = 50, batch_size: int = 256, 
+    def train(self, 
+              X_train, 
+              y_train, 
+              X_val=None, 
+              y_val=None,
+              epochs: int = 50, 
+              batch_size: int = 256, 
               verbose: bool = True) -> dict:
         """
         Train the neural network.
@@ -100,90 +114,116 @@ class FeedForwardModel:
             Dictionary with training history
         """
         self.input_dim = X_train.shape[1]
-        num_classes = len(np.unique(y_train)) if len(np.unique(y_train)) > 2 else 1
+
+        # Determine number of classes
+        unique_classes = np.unique(y_train)
+        self.num_classes = len(unique_classes)
         
         # Create model
         self.model = FeedForwardNN(
             self.input_dim, 
             self.hidden_dims, 
-            num_classes=num_classes,
+            num_classes=self.num_classes,
             dropout=self.dropout
         ).to(self.device)
         
         # Loss and optimizer
-        if num_classes == 1:
-            criterion = nn.BCELoss()
-        else:
-            criterion = nn.CrossEntropyLoss()
-        
+        criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         
         # Data loaders
         train_dataset = TabularDataset(X_train, y_train)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        
-        val_loader = None
         if X_val is not None and y_val is not None:
             val_dataset = TabularDataset(X_val, y_val)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-        
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
+
         # Training loop
         history = {'train_loss': [], 'val_loss': [], 'val_acc': [], 'val_f1': []}
+
+        epoch_iterator = tqdm(range(epochs), desc="Training", unit="epoch") # Create progress bar
         
-        for epoch in range(epochs):
+        for epoch in epoch_iterator:
+
             # Training
             self.model.train()
             train_loss = 0.0
+            valid_batches = 0
+            
             for batch_X, batch_y in train_loader:
                 batch_X, batch_y = batch_X.to(self.device), batch_y.to(self.device)
                 
                 optimizer.zero_grad()
-                outputs = self.model(batch_X).squeeze()
+                outputs = self.model(batch_X)
                 loss = criterion(outputs, batch_y)
+                
                 loss.backward()
+                
                 optimizer.step()
                 
                 train_loss += loss.item()
+                valid_batches += 1
             
-            train_loss /= len(train_loader)
+            # Calculate average loss only over valid batches
+            train_loss /= valid_batches
+
             history['train_loss'].append(train_loss)
             
             # Validation
-            if val_loader is not None:
+            if X_val is not None and y_val is not None:
+                
                 self.model.eval()
                 val_loss = 0.0
                 all_preds = []
                 all_labels = []
+                valid_val_batches = 0
                 
                 with torch.no_grad():
                     for batch_X, batch_y in val_loader:
                         batch_X, batch_y = batch_X.to(self.device), batch_y.to(self.device)
-                        outputs = self.model(batch_X).squeeze()
-                        loss = criterion(outputs, batch_y)
-                        val_loss += loss.item()
                         
-                        if num_classes == 1:
-                            preds = (outputs > 0.5).cpu().numpy()
-                        else:
-                            preds = outputs.argmax(dim=1).cpu().numpy()
+                        outputs = self.model(batch_X)
+                        loss = criterion(outputs, batch_y)
+                        
+                        val_loss += loss.item()
+                        valid_val_batches += 1
+                        
+                        preds = outputs.argmax(dim=1).cpu().numpy()
                         
                         all_preds.extend(preds)
                         all_labels.extend(batch_y.cpu().numpy())
                 
-                val_loss /= len(val_loader)
+                # Calculate average loss only over valid batches
+                val_loss /= valid_val_batches
+            
                 val_acc = accuracy_score(all_labels, all_preds)
-                val_f1 = f1_score(all_labels, all_preds, average='binary' if num_classes == 1 else 'macro')
+                val_f1 = f1_score(all_labels, all_preds, average='macro')
                 
                 history['val_loss'].append(val_loss)
                 history['val_acc'].append(val_acc)
                 history['val_f1'].append(val_f1)
                 
-                if verbose and (epoch + 1) % 10 == 0:
-                    print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.4f} - "
-                          f"Val Loss: {val_loss:.4f} - Val Acc: {val_acc:.4f} - Val F1: {val_f1:.4f}")
+                # Update epoch progress bar
+                try:
+                    epoch_iterator.set_postfix({
+                        'train_loss': f'{train_loss:.4f}',
+                        'val_loss': f'{val_loss:.4f}',
+                        'val_acc': f'{val_acc:.4f}',
+                        'val_f1': f'{val_f1:.4f}'
+                    })
+                except:
+                    # Fallback to print if tqdm update fails
+                    print(f"Epoch {epoch+1:3d}/{epochs} | "
+                            f"Train Loss: {train_loss:.4f} | "
+                            f"Val Loss: {val_loss:.4f} | "
+                            f"Val Acc: {val_acc:.4f} | "
+                            f"Val F1: {val_f1:.4f}")
             else:
-                if verbose and (epoch + 1) % 10 == 0:
-                    print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.4f}")
+                # No validation set
+                try:
+                    epoch_iterator.set_postfix({'train_loss': f'{train_loss:.4f}'})
+                except:
+                    print(f"Epoch {epoch+1:3d}/{epochs} | Train Loss: {train_loss:.4f}")
         
         return history
     
@@ -193,24 +233,43 @@ class FeedForwardModel:
             raise ValueError("Model not trained. Call train() first.")
         
         self.model.eval()
-        dataset = TabularDataset(X, np.zeros(len(X)))  # Dummy labels
+        # Use dummy labels - type doesn't matter for prediction
+        dummy_y = np.zeros(len(X), dtype=np.int64)
+        dataset = TabularDataset(X, dummy_y)
         loader = DataLoader(dataset, batch_size=256, shuffle=False)
         
         predictions = []
         with torch.no_grad():
             for batch_X, _ in loader:
                 batch_X = batch_X.to(self.device)
-                outputs = self.model(batch_X).squeeze().cpu().numpy()
-                predictions.extend(outputs)
+                outputs = self.model(batch_X)
+                # Output is (batch_size, num_classes), apply softmax and get argmax
+                probs = torch.softmax(outputs, dim=1)
+                preds = probs.argmax(dim=1).cpu().numpy()
+                predictions.extend(preds)
         
         return np.array(predictions)
     
     def predict_proba(self, X):
         """Get prediction probabilities."""
-        preds = self.predict(X)
-        if preds.ndim == 1:
-            # Binary classification
-            return np.column_stack([1 - preds, preds])
-        return preds
+        if self.model is None:
+            raise ValueError("Model not trained. Call train() first.")
+        
+        self.model.eval()
+        # Use dummy labels - type doesn't matter for prediction
+        dummy_y = np.zeros(len(X), dtype=np.int64)
+        dataset = TabularDataset(X, dummy_y)
+        loader = DataLoader(dataset, batch_size=256, shuffle=False)
+        
+        probabilities = []
+        with torch.no_grad():
+            for batch_X, _ in loader:
+                batch_X = batch_X.to(self.device)
+                outputs = self.model(batch_X)
+                # Output is (batch_size, num_classes), apply softmax
+                probs = torch.softmax(outputs, dim=1).cpu().numpy()
+                probabilities.extend(probs)
+        
+        return np.array(probabilities)
 
 
