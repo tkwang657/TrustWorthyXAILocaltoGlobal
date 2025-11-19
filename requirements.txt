@@ -25,9 +25,12 @@ torch==2.9.0
 tqdm==4.67.1
 typing_extensions==4.15.0
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 tzdata==2025.2
 scikit-learn==1.7.2
 torch==2.9.0
 tqdm==4.67.1
+=======
+>>>>>>> Stashed changes
 =======
 >>>>>>> Stashed changes
