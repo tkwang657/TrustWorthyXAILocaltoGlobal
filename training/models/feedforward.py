@@ -14,21 +14,16 @@ from tqdm import tqdm
 from sklearn.utils.class_weight import compute_class_weight
 
 
-class TabularDataset(Dataset):
-    """PyTorch dataset for the pandas data"""
+
+class MortageDataset(Dataset):
     
     def __init__(self, X, y):
 
-        # Convert to numpy array first for validation
-        X_data = X.values if hasattr(X, 'values') else X
-        if isinstance(X_data, pd.DataFrame):
-            X_data = X_data.values
-         
-        self.X = torch.FloatTensor(X_data)
+        X_values = np.array(X)
+        y_values = np.array(y)
 
-        y_data = y.values if hasattr(y, 'values') else y
-        y_data = np.array(y_data).astype(np.int64)
-        self.y = torch.LongTensor(y_data)
+        self.X = torch.tensor(X_values, dtype=torch.float32)
+        self.y = torch.tensor(y_values, dtype=torch.long)# so that its 0 to 7 and not 1 to 8
         
     def __len__(self):
         return len(self.X)
@@ -37,12 +32,18 @@ class TabularDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
+
+
 class FeedForwardNN(nn.Module):
     """
-    Basic feed-forward neural network with dropout for tabular data.
+    Deep feed-forward neural network with dropout for tabular data.
     """
-    
-    def __init__(self, input_dim: int, hidden_dims: list = [128, 64, 32], num_classes: int = 1, dropout: float = 0.3):
+
+    def __init__(self, 
+                 input_dim: int, 
+                 hidden_dims: list = [512, 512, 256, 256, 128, 128, 64], 
+                 num_classes: int = 1, 
+                 dropout: float = 0.3):
         super().__init__()
         
         layers = []
@@ -59,9 +60,10 @@ class FeedForwardNN(nn.Module):
         
         self.network = nn.Sequential(*layers)
         
-        
     def forward(self, x):
         return self.network(x)
+
+
 
 
 class FeedForwardModel:
@@ -113,10 +115,18 @@ class FeedForwardModel:
         Returns:
             Dictionary with training history
         """
-        self.input_dim = X_train.shape[1]
+
+        # Data loaders
+        train_dataset = MortageDataset(X_train, y_train)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
+        if X_val is not None and y_val is not None:
+            val_dataset = MortageDataset(X_val, y_val)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+        self.input_dim = train_dataset.X.shape[1]
 
         # Determine number of classes
-        unique_classes = np.unique(y_train)
+        unique_classes = np.unique(train_dataset.y)
         self.num_classes = len(unique_classes)
         
         # Create model
@@ -129,8 +139,10 @@ class FeedForwardModel:
         
         # Loss and optimizer
         # weighting loss since theres WAY more of some classes than others in the dataset
-        classes = np.unique(y_train)  # keep 1–8
-        class_weights = compute_class_weight('balanced', classes=classes, y=y_train)
+        classes = np.unique(train_dataset.y)  # keep 1–8
+        print("CLASSES:", classes)
+        print(train_dataset.y.unique())
+        class_weights = compute_class_weight('balanced', classes=classes, y=train_dataset.y.cpu().numpy())
         # Map class weights into tensor in the correct order
         weight_tensor = torch.zeros(len(classes), dtype=torch.float32)
         for i, cls in enumerate(classes):
@@ -138,13 +150,6 @@ class FeedForwardModel:
         weight_tensor = weight_tensor.to(self.device)
         criterion = nn.CrossEntropyLoss(weight=weight_tensor)
         optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        
-        # Data loaders
-        train_dataset = TabularDataset(X_train, y_train)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
-        if X_val is not None and y_val is not None:
-            val_dataset = TabularDataset(X_val, y_val)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
         # Training loop
         history = {'train_loss': [], 'val_loss': [], 'val_acc': [], 'val_f1': []}
@@ -243,7 +248,7 @@ class FeedForwardModel:
         self.model.eval()
         # Use dummy labels - type doesn't matter for prediction
         dummy_y = np.zeros(len(X), dtype=np.int64)
-        dataset = TabularDataset(X, dummy_y)
+        dataset = MortageDataset(X, dummy_y)
         loader = DataLoader(dataset, batch_size=256, shuffle=False)
         
         predictions = []
@@ -266,7 +271,7 @@ class FeedForwardModel:
         self.model.eval()
         # Use dummy labels - type doesn't matter for prediction
         dummy_y = np.zeros(len(X), dtype=np.int64)
-        dataset = TabularDataset(X, dummy_y)
+        dataset = MortageDataset(X, dummy_y)
         loader = DataLoader(dataset, batch_size=256, shuffle=False)
         
         probabilities = []
