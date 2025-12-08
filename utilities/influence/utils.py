@@ -1,6 +1,7 @@
 import sys
 import json
 import logging
+import torch
 from pathlib import Path
 from datetime import datetime as dt
 
@@ -120,10 +121,11 @@ def init_logging(filename=None):
 
 def get_default_config():
     """Returns a default config file"""
+    
     config = {
         'outdir': 'outdir',
         'seed': 42,
-        'gpu': 0,
+        'gpu': 0 if torch.cuda.is_available() else -1,
         'dataset': 'CIFAR10',
         'num_classes': 10,
         'test_sample_num': 1,
@@ -135,5 +137,7 @@ def get_default_config():
         'calc_method': 'img_wise',
         'log_filename': None,
     }
+
+    print("gpu value in config:", config['gpu'])
 
     return config

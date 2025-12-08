@@ -46,7 +46,7 @@ def s_test(z_test, t_test, model, z_loader, gpu=-1, damp=0.01, scale=25.0,
         #########################
         for x, t in z_loader:
             if gpu >= 0:
-                x, t = x.cuda(), t.cuda()
+                x, t = x.cuda(), t.cuda(),
             y = model(x)
             loss = calc_loss(y, t)
             params = [ p for p in model.parameters() if p.requires_grad ]
@@ -73,7 +73,8 @@ def calc_loss(y, t):
     # if dim == [0, 1, 3] then dim=0; else dim=1
     ####################
     # y = torch.nn.functional.log_softmax(y, dim=0)
-    y = torch.nn.functional.log_softmax(y)
+    # For classification: y shape is (batch_size, num_classes), so use dim=1
+    y = torch.nn.functional.log_softmax(y, dim=1)
     loss = torch.nn.functional.nll_loss(
         y, t, weight=None, reduction='mean')
     return loss
@@ -101,7 +102,10 @@ def grad_z(z, t, model, gpu=-1):
     loss = calc_loss(y, t)
     # Compute sum of gradients from model parameters to loss
     params = [ p for p in model.parameters() if p.requires_grad ]
-    return list(grad(loss, params, create_graph=True))
+    grads = grad(loss, params, create_graph=True, allow_unused=True)
+    # Replace None gradients (unused parameters) with zero tensors
+    grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, params)]
+    return list(grads)
 
 
 def hvp(y, w, v):
@@ -127,7 +131,9 @@ def hvp(y, w, v):
         raise(ValueError("w and v must have the same length."))
 
     # First backprop
-    first_grads = grad(y, w, retain_graph=True, create_graph=True)
+    first_grads = grad(y, w, retain_graph=True, create_graph=True, allow_unused=True)
+    # Replace None gradients with zero tensors
+    first_grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(first_grads, w)]
 
     # Elementwise products
     elemwise_products = 0
@@ -135,6 +141,8 @@ def hvp(y, w, v):
         elemwise_products += torch.sum(grad_elem * v_elem)
 
     # Second backprop
-    return_grads = grad(elemwise_products, w, create_graph=True)
+    return_grads = grad(elemwise_products, w, create_graph=True, allow_unused=True)
+    # Replace None gradients with zero tensors
+    return_grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(return_grads, w)]
 
     return return_grads
