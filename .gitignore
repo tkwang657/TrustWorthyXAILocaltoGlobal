@@ -209,3 +209,4 @@ __marimo__/
 # dataset folder 
 datasets/*
 .myenv/
+500ktest_dataset_lar.csv
