@@ -59,6 +59,7 @@ def compute_influence_for_test_point(model, train_loader, test_loader, test_inde
     influences = []
     device=torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     s_vec=s_vec.to(device)
+    start=datetime.datetime.now()
     for i in range(n_train):
         z_train, t_train = train_loader.dataset[i]
         z_train = train_loader.collate_fn([z_train])
@@ -67,16 +68,17 @@ def compute_influence_for_test_point(model, train_loader, test_loader, test_inde
             time_a = datetime.datetime.now()
         grad_vec = grad_z(z_train, t_train, model, device=config['device'])
         grad_vec=[g.to(device) for g in grad_vec]
+        influence_val = -sum(torch.sum(g * s).detach().cpu().item()
+                             for g, s in zip(grad_vec, s_vec)) / n_train
         if time_logging:
             time_b = datetime.datetime.now()
             time_delta = time_b - time_a
-            logging.info(f"Time for grad_z iter:"
-                         f" {time_delta.total_seconds() * 1000}")
-        influence_val = -sum(torch.sum(g * s).detach().cpu().item()
-                             for g, s in zip(grad_vec, s_vec)) / n_train
+            logging.debug(f"Time for single influence pair in ms:"f" {time_delta.total_seconds() * 1000}")
         influences.append(influence_val)
         display_progress("Calc. influence function: ", i, n_train)
-
+    end=datetime.datetime.now()
+    diff=end-start
+    logging.info(f"Time for dataset-influence of single test point:"f" {diff.total_seconds() * 1000}")
     harmful = np.argsort(influences).tolist()
     helpful = harmful[::-1]
     return influences, harmful, helpful
@@ -136,6 +138,7 @@ def calc_influence_batch(model, train_loader, test_loader, indices=None, config=
 def calc_influence_on_pair(model, train_loader, test_loader, train_id, test_id, s_vec=None, device=-1, damp=0.01, scale=25, recursion_depth=5000, r=10):
     gpu=device
     device = torch.device('cpu') if device == -1 else torch.device(f'cuda:{device}')
+    time_a=datetime.datetime.now()
     model.to(device)
     z_train, t_train = train_loader.dataset[train_id]
     z_train = train_loader.collate_fn([z_train]).to(device)
@@ -145,11 +148,14 @@ def calc_influence_on_pair(model, train_loader, test_loader, train_id, test_id, 
     t_test = test_loader.collate_fn([t_test]).to(device)
 
     if s_vec is None:
-        s_vec = compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=device, damp=damp, scale=scale, recursion_depth=recursion_depth, r=r)
+        s_vec = compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=gpu, damp=damp, scale=scale, recursion_depth=recursion_depth, r=r)
     s_vec = s_vec.to(device)
     grad_vec=grad_z(z_train, t_train, model, device=gpu)
     grad_vec = [g.to(device) for g in grad_vec] if isinstance(grad_vec, list) else grad_vec.to(device)
     influence_val = -sum(torch.sum(g * s).detach().cpu().item() for g, s in zip(grad_vec, s_vec))
+    time_b=datetime.datetime.now()
+    diff=time_b-time_a
+    logging.info("Time for influence of single z_train z-test pair:"f" {(train_id, test_id)}: {diff.total_seconds() * 1000}")
     return influence_val
 
 def calc_average_influence_of_point(model, train_loader, test_loader, train_index, config, test_indices=None):

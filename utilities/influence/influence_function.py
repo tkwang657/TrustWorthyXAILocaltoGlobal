@@ -31,7 +31,7 @@ def s_test(z_test, t_test, model, z_loader, device=-1, damp=0.01, scale=25.0,
 
     Returns:
         h_estimate: list of torch tensors, s_test"""
-    print(f"z_test: {z_test}, t_test: {t_test}")
+    #print(f"z_test: {z_test}, t_test: {t_test}")
     v = grad_z(z_test, t_test, model, device)
     h_estimate = [t.clone().detach() for t in v]
     stoppingcounter=0
@@ -70,7 +70,7 @@ def s_test(z_test, t_test, model, z_loader, device=-1, damp=0.01, scale=25.0,
                     break
             else:
                 stoppingcounter=0
-        display_progress("Calc. s_test recursions: ", i, recursion_depth, h_estimate)
+        #display_progress("Calc. s_test recursions: ", i, recursion_depth, h_estimate)
     return h_estimate
 
 def calc_loss(y, t):
