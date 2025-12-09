@@ -35,23 +35,21 @@ def _to_scalar(x):
 def compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=-1,
                        damp=0.01, scale=25, recursion_depth=5000, r=1):
     """Compute s_test (inverse-HVP * grad) for one test point."""
-    device = torch.device('cpu') if device == -1 else torch.device(f'cuda:{device}')
-    model.to(device)
-    z_test = z_test.to(device)
-    t_test = t_test.to(device)
+    model.to(torch.device('cpu') if device == -1 else torch.device(f'cuda:{device}'))
     s_vec_list=[]
     for i in range(r):
-        s_vec=s_test(z_test=z_test, t_test=t_test, model=model, z_loader=train_loader, gpu=device, damp=damp, scale=scale, recursion_depth=recursion_depth)
+        s_vec=s_test(z_test=z_test, t_test=t_test, model=model, z_loader=train_loader, device=device, damp=damp, scale=scale, recursion_depth=recursion_depth)
         display_progress("Averaging r-times: ", i, r)
         s_flat = torch.cat([s.flatten() for s in s_vec]).to(device)
         s_vec_list.append(s_flat)
     s_avg = torch.stack(s_vec_list).mean(dim=0)
+    print(f"Shape of s_vec: {s_avg.shape}")
     return s_avg
 
 
 
 def compute_influence_for_test_point(model, train_loader, test_loader, test_index, config, s_vec=None, time_logging=False):
-    """Return influences, harmful idxs, helpful idxs for a single test point."""
+    """Return influences, harmful idxs, helpful idxs for a single test point over entire training set."""
     z_test, t_test = test_loader.dataset[test_index]
     if s_vec is None:
         z_test = test_loader.collate_fn([z_test])
@@ -86,7 +84,7 @@ def compute_influence_for_test_point(model, train_loader, test_loader, test_inde
 
 def calc_influence_batch(model, train_loader, test_loader, indices=None, config=None, cachedir=None):
     """
-    Compute influences for every test sample list of indices to calculate influence for
+    Compute influences for every test index in indices
     """
     if config is None:
         config = get_default_config()
@@ -139,14 +137,12 @@ def calc_influence_on_pair(model, train_loader, test_loader, train_id, test_id, 
     gpu=device
     device = torch.device('cpu') if device == -1 else torch.device(f'cuda:{device}')
     model.to(device)
-    z_train = train_loader.collate_fn([z_train])
-    t_train = train_loader.collate_fn([t_train])
-    z_test = test_loader.collate_fn([z_test])
-    t_test = test_loader.collate_fn([t_test])
-    z_train = z_train.to(device)
-    t_train = t_train.to(device)
-    z_test = z_test.to(device)
-    t_test = t_test.to(device)
+    z_train, t_train = train_loader.dataset[train_id]
+    z_train = train_loader.collate_fn([z_train]).to(device)
+    t_train = train_loader.collate_fn([t_train]).to(device)
+    z_test, t_test = train_loader.dataset[test_id]
+    z_test = test_loader.collate_fn([z_test]).to(device)
+    t_test = test_loader.collate_fn([t_test]).to(device)
 
     if s_vec is None:
         s_vec = compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=device, damp=damp, scale=scale, recursion_depth=recursion_depth, r=r)
@@ -155,3 +151,20 @@ def calc_influence_on_pair(model, train_loader, test_loader, train_id, test_id, 
     grad_vec = [g.to(device) for g in grad_vec] if isinstance(grad_vec, list) else grad_vec.to(device)
     influence_val = -sum(torch.sum(g * s).detach().cpu().item() for g, s in zip(grad_vec, s_vec))
     return influence_val
+
+def calc_average_influence_of_point(model, train_loader, test_loader, train_index, config, test_indices=None):
+    """
+    Compute the average influence of a single training point across all provided test points.
+    Returns a single scalar (sum of influences).
+    """
+    if test_indices is None:
+        test_indices = list(range(len(test_loader.dataset)))
+    
+    total_influence = 0.0
+    for test_idx in test_indices:
+        inf=calc_influence_on_pair(model=model, train_loader=train_loader, test_loader=test_loader, train_id=train_index, test_id=test_idx, device=config['device'], damp=config['damp'], scale=config['scale'], recursion_depth=config['recursion_depth'], r=config['r_averaging'])
+        total_influence+=inf
+    avg_influence = total_influence / len(test_indices)
+    return avg_influence
+
+
