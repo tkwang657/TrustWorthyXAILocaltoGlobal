@@ -125,19 +125,18 @@ def get_default_config():
     config = {
         'outdir': 'outdir',
         'seed': 42,
-        'gpu': 0 if torch.cuda.is_available() else -1,
-        'dataset': 'CIFAR10',
-        'num_classes': 10,
-        'test_sample_num': 1,
-        'test_start_index': 0,
-        'recursion_depth': 1,
-        'r_averaging': 1,
-        'scale': None,
-        'damp': None,
-        'calc_method': 'img_wise',
+        'device': 0 if torch.cuda.is_available() else -1,
+        'dataset': '2024LAR',
+        'num_classes': 2,
+        'test_sample_num': False,
+        'test_start_index': False,
+        'recursion_depth': 1000, #Paper suggests recursion_depth * r =datasetsize
+        'r_averaging': 500,
+        'scale': 25,
+        'damp': 0.01,
         'log_filename': None,
     }
 
-    print("gpu value in config:", config['gpu'])
+    print("gpu value in config:", config['device'])
 
     return config

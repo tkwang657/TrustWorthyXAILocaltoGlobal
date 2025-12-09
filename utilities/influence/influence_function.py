@@ -11,7 +11,7 @@ influence_path = os.path.join(project_root, 'utilities', 'influence')
 if influence_path not in sys.path:
     sys.path.append(influence_path)
 
-def s_test(z_test, t_test, model, z_loader, gpu=-1, damp=0.01, scale=25.0,
+def s_test(z_test, t_test, model, z_loader, device=-1, damp=0.01, scale=25.0,
            recursion_depth=5000):
     """s_test can be precomputed for each test point of interest, and then
     multiplied with grad_z to get the desired value for each training point.
@@ -23,7 +23,7 @@ def s_test(z_test, t_test, model, z_loader, gpu=-1, damp=0.01, scale=25.0,
         t_test: torch tensor, contains all test data labels
         model: torch NN, model used to evaluate the dataset
         z_loader: torch Dataloader, can load the training dataset
-        gpu: int, GPU id to use if >=0 and -1 means use CPU
+        device: int, GPU id to use if >=0 and -1 means use CPU
         damp: float, dampening factor
         scale: float, scaling factor
         recursion_depth: int, number of iterations aka recursion depth
@@ -32,7 +32,7 @@ def s_test(z_test, t_test, model, z_loader, gpu=-1, damp=0.01, scale=25.0,
     Returns:
         h_estimate: list of torch tensors, s_test"""
     print(f"z_test: {z_test}, t_test: {t_test}")
-    v = grad_z(z_test, t_test, model, gpu)
+    v = grad_z(z_test, t_test, model, device)
     h_estimate = v.copy()
 
     ################################
@@ -46,7 +46,7 @@ def s_test(z_test, t_test, model, z_loader, gpu=-1, damp=0.01, scale=25.0,
         # TODO: do x, t really have to be chosen RANDOMLY from the train set?
         #########################
         for x, t in z_loader:
-            if gpu >= 0:
+            if device >= 0:
                 x, t = x.cuda(), t.cuda(),
             y = model(x)
             loss = calc_loss(y, t)
@@ -81,7 +81,7 @@ def calc_loss(y, t):
     return loss
 
 
-def grad_z(z, t, model, gpu=-1):
+def grad_z(z, t, model, device=-1):
     """Calculates the gradient z. One grad_z should be computed for each
     training sample.
 
@@ -90,14 +90,14 @@ def grad_z(z, t, model, gpu=-1):
             e.g. an image sample (batch_size, 3, 256, 256)
         t: torch tensor, training data labels
         model: torch NN, model used to evaluate the dataset
-        gpu: int, device id to use for GPU, -1 for CPU
+        device: int, device id to use for GPU, -1 for CPU
 
     Returns:
         grad_z: list of torch tensor, containing the gradients
             from model parameters to loss"""
     model.eval()
     # initialize
-    if gpu >= 0:
+    if device >= 0:
         z, t = z.cuda(), t.cuda()
     y = model(z)
     loss = calc_loss(y, t)
@@ -143,7 +143,5 @@ def hvp(y, w, v):
 
     # Second backprop
     return_grads = grad(elemwise_products, w, create_graph=True, allow_unused=True)
-    # Replace None gradients with zero tensors
     return_grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(return_grads, w)]
-
     return return_grads

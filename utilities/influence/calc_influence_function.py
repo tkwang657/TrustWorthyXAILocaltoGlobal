@@ -20,21 +20,8 @@ influence_path = os.path.join(project_root, 'utilities', 'influence')
 if influence_path not in sys.path:
     sys.path.append(influence_path)
 
-from influence_function import s_test, grad_z  # noqa: E402
-from utils import save_json, display_progress  # noqa: E402
-
-
-def get_default_config():
-    """Config tuned for tabular; keep recursion_depth modest for speed."""
-    return {
-        'gpu': 0 if torch.cuda.is_available() else -1,
-        'damp': 0.01,
-        'scale': 25.0,
-        'recursion_depth': 300,   # reduce if slow, increase for accuracy
-        'r_averaging': 1,
-        'top_k': 20,
-        'outdir': 'outdir',
-    }
+from influence_function import s_test, grad_z  
+from utils import save_json, display_progress, get_default_config  
 
 
 def _to_scalar(x):
@@ -45,32 +32,48 @@ def _to_scalar(x):
     return float(x)
 
 
-def compute_s_test_for_point(model, z_test, t_test, train_loader, config):
+def compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=-1,
+                       damp=0.01, scale=25, recursion_depth=5000, r=1):
     """Compute s_test (inverse-HVP * grad) for one test point."""
-    return s_test(
-        z_test,
-        t_test,
-        model,
-        train_loader,
-        gpu=config['gpu'],
-        damp=config['damp'],
-        scale=config['scale'],
-        recursion_depth=config['recursion_depth'],
-    )
+    device = torch.device('cpu') if device == -1 else torch.device(f'cuda:{device}')
+    model.to(device)
+    z_test = z_test.to(device)
+    t_test = t_test.to(device)
+    s_vec_list=[]
+    for i in range(r):
+        s_vec=s_test(z_test=z_test, t_test=t_test, model=model, z_loader=train_loader, gpu=device, damp=damp, scale=scale, recursion_depth=recursion_depth)
+        display_progress("Averaging r-times: ", i, r)
+        s_flat = torch.cat([s.flatten() for s in s_vec]).to(device)
+        s_vec_list.append(s_flat)
+    s_avg = torch.stack(s_vec_list).mean(dim=0)
+    return s_avg
 
 
-def compute_influence_for_test_point(model, train_loader, z_test, t_test, config):
+
+def compute_influence_for_test_point(model, train_loader, test_loader, test_index, config, s_vec=None, time_logging=False):
     """Return influences, harmful idxs, helpful idxs for a single test point."""
-    s_vec = compute_s_test_for_point(model, z_test, t_test, train_loader, config)
+    z_test, t_test = test_loader.dataset[test_index]
+    if s_vec is None:
+        z_test = test_loader.collate_fn([z_test])
+        t_test = test_loader.collate_fn([t_test])
+        s_vec = compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=config['device'], damp=config['damp'], scale=config['scale'], recursion_depth=config['recursion_depth'], r=config['r_averaging'])
     n_train = len(train_loader.dataset)
     influences = []
-
+    device=torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    s_vec=s_vec.to(device)
     for i in range(n_train):
         z_train, t_train = train_loader.dataset[i]
         z_train = train_loader.collate_fn([z_train])
         t_train = train_loader.collate_fn([t_train])
-
-        grad_vec = grad_z(z_train, t_train, model, gpu=config['gpu'])
+        if time_logging:
+            time_a = datetime.datetime.now()
+        grad_vec = grad_z(z_train, t_train, model, device=config['device'])
+        grad_vec=[g.to(device) for g in grad_vec]
+        if time_logging:
+            time_b = datetime.datetime.now()
+            time_delta = time_b - time_a
+            logging.info(f"Time for grad_z iter:"
+                         f" {time_delta.total_seconds() * 1000}")
         influence_val = -sum(torch.sum(g * s).detach().cpu().item()
                              for g, s in zip(grad_vec, s_vec)) / n_train
         influences.append(influence_val)
@@ -81,38 +84,45 @@ def compute_influence_for_test_point(model, train_loader, z_test, t_test, config
     return influences, harmful, helpful
 
 
-def calc_influence_dataset(model, train_loader, test_loader, config=None):
+def calc_influence_batch(model, train_loader, test_loader, indices=None, config=None, cachedir=None):
     """
-    Compute influences for every test sample (or the first `config.top_k`
-    if you wish to slice afterwards in the notebook for speed).
+    Compute influences for every test sample list of indices to calculate influence for
     """
     if config is None:
         config = get_default_config()
 
     outdir = Path(config['outdir'])
     outdir.mkdir(exist_ok=True, parents=True)
+    if cachedir:
+        cachedir = Path(cachedir)
+        cachedir.mkdir(exist_ok=True, parents=True)
 
     results = {}
-    test_len = len(test_loader.dataset)
+    test_len=0
+    if indices is None:
+        test_len = len(test_loader.dataset)
+        indices=list(range(len(test_loader.dataset)))
+    else:
+        test_len=len(indices)
+
     for j in range(test_len):
         start = time.time()
-        z_test, t_test = test_loader.dataset[j]
+        z_test, t_test = test_loader.dataset[indices[j]]
         z_test = test_loader.collate_fn([z_test])
         t_test = test_loader.collate_fn([t_test])
-
         infl, harmful, helpful = compute_influence_for_test_point(
-            model, train_loader, z_test, t_test, config
+            model, train_loader, test_loader=test_loader, test_index=indices[j], config=None
         )
 
         # Convert everything to JSON-friendly types
         infl_json = [_to_scalar(v) for v in infl]
         results[str(j)] = {
             "label": _to_scalar(t_test[0]),
-            "num_in_dataset": j,
+            "num_in_dataset": indices[j],
             "time_calc_influence_s": time.time() - start,
             "influence": infl_json,
-            "harmful": [int(x) for x in harmful[:config['top_k']]],
-            "helpful": [int(x) for x in helpful[:config['top_k']]],
+            "harmful": [int(x) for x in harmful],
+            "helpful": [int(x) for x in helpful],
         }
 
         tmp_path = outdir / f"influence_results_tmp_last-i_{j}.json"
@@ -123,3 +133,25 @@ def calc_influence_dataset(model, train_loader, test_loader, config=None):
     save_json(results, final_path)
     logging.info(f"Saved influence results to {final_path}")
     return results
+
+
+def calc_influence_on_pair(model, train_loader, test_loader, train_id, test_id, s_vec=None, device=-1, damp=0.01, scale=25, recursion_depth=5000, r=10):
+    gpu=device
+    device = torch.device('cpu') if device == -1 else torch.device(f'cuda:{device}')
+    model.to(device)
+    z_train = train_loader.collate_fn([z_train])
+    t_train = train_loader.collate_fn([t_train])
+    z_test = test_loader.collate_fn([z_test])
+    t_test = test_loader.collate_fn([t_test])
+    z_train = z_train.to(device)
+    t_train = t_train.to(device)
+    z_test = z_test.to(device)
+    t_test = t_test.to(device)
+
+    if s_vec is None:
+        s_vec = compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=device, damp=damp, scale=scale, recursion_depth=recursion_depth, r=r)
+    s_vec = s_vec.to(device)
+    grad_vec=grad_z(z_train, t_train, model, device=gpu)
+    grad_vec = [g.to(device) for g in grad_vec] if isinstance(grad_vec, list) else grad_vec.to(device)
+    influence_val = -sum(torch.sum(g * s).detach().cpu().item() for g, s in zip(grad_vec, s_vec))
+    return influence_val
