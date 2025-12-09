@@ -12,11 +12,11 @@ if influence_path not in sys.path:
     sys.path.append(influence_path)
 
 def s_test(z_test, t_test, model, z_loader, device=-1, damp=0.01, scale=25.0,
-           recursion_depth=5000):
+           recursion_depth=5000, eps=2e-4, patience=None):
     """s_test can be precomputed for each test point of interest, and then
     multiplied with grad_z to get the desired value for each training point.
     Here, strochastic estimation is used to calculate s_test. s_test is the
-    Inverse Hessian Vector Product.
+    Inverse Hessian Vector Product. Added early stopping
 
     Arguments:
         z_test: torch tensor, test data points, such as test images
@@ -33,33 +33,45 @@ def s_test(z_test, t_test, model, z_loader, device=-1, damp=0.01, scale=25.0,
         h_estimate: list of torch tensors, s_test"""
     print(f"z_test: {z_test}, t_test: {t_test}")
     v = grad_z(z_test, t_test, model, device)
-    h_estimate = v.copy()
-
-    ################################
-    # TODO: Dynamically set the recursion depth so that iterations stops
-    # once h_estimate stabilises
-    ################################
+    h_estimate = [t.clone().detach() for t in v]
+    stoppingcounter=0
     for i in range(recursion_depth):
-        # take just one random sample from training dataset
-        # easiest way to just use the DataLoader once, break at the end of loop
-        #########################
-        # TODO: do x, t really have to be chosen RANDOMLY from the train set?
-        #########################
-        for x, t in z_loader:
-            if device >= 0:
-                x, t = x.cuda(), t.cuda(),
-            y = model(x)
-            loss = calc_loss(y, t)
-            params = [ p for p in model.parameters() if p.requires_grad ]
-            hv = hvp(loss, params, h_estimate)
-            # Recursively caclulate h_estimate
-            h_estimate = [
-                _v + (1 - damp) * _h_e - _hv / scale
-                for _v, _h_e, _hv in zip(v, h_estimate, hv)]
-            break
-        display_progress("Calc. s_test recursions: ", i, recursion_depth)
-    return h_estimate
+        # Get a new random minibatch each step
+        try:
+            x, t = next(z_loader_iter)
+        except NameError:
+            z_loader_iter = iter(z_loader)
+            x, t = next(z_loader_iter)
+        except StopIteration:
+            z_loader_iter = iter(z_loader)
+            x, t = next(z_loader_iter)
 
+        if device >= 0:
+            x, t = x.cuda(), t.cuda()
+
+        y = model(x)
+        loss = calc_loss(y, t)
+        params = [p for p in model.parameters() if p.requires_grad]
+        hv = hvp(loss, params, h_estimate)
+
+        # Update h_estimate without tracking gradients
+        with torch.no_grad():
+            h_new = [_v + (1 - damp) * _h_e - _hv / scale
+                     for _v, _h_e, _hv in zip(v, h_estimate, hv)]
+
+        # Optional: early stopping if h_estimate converges
+        delta = sum((_h_e - _h_n).norm() / (_h_e.norm() + 1e-9) for _h_e, _h_n in zip(h_estimate, h_new))
+        h_estimate = h_new
+        if patience is not None:
+            if delta<eps:
+                stoppingcounter+=1
+                if stoppingcounter >= patience:
+                    #print(f"Early stopping at recursion {i} after {patience} stable steps.")
+                    break
+            else:
+                stoppingcounter=0
+        display_progress("Calc. s_test recursions: ", i, recursion_depth, h_estimate)
+    return h_estimate
 
 def calc_loss(y, t):
     """Calculates the loss
