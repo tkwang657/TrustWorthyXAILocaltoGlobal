@@ -150,12 +150,14 @@ def calc_influence_on_pair(model, train_loader, test_loader, train_id, test_id, 
     if s_vec is None:
         s_vec = compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=gpu, damp=damp, scale=scale, recursion_depth=recursion_depth, r=r)
     s_vec = s_vec.to(device)
+    logging.info(f"S_vec for test point {test_id}: {s_vec}")
     grad_vec=grad_z(z_train, t_train, model, device=gpu)
     grad_vec = [g.to(device) for g in grad_vec] if isinstance(grad_vec, list) else grad_vec.to(device)
+    #logging.info(f"Grad_vec for train point {train_id}: {grad_vec}")
     influence_val = -sum(torch.sum(g * s).detach().cpu().item() for g, s in zip(grad_vec, s_vec))
     time_b=datetime.datetime.now()
     diff=time_b-time_a
-    logging.info("Time for influence of single z_train z-test pair:"f" {(train_id, test_id)}: {diff.total_seconds() * 1000}")
+    logging.info("Influence of single z_train z-test pair:"f" {(train_id, test_id)} : {influence_val}. Time: {diff.total_seconds()} seconds")
     return influence_val
 
 def calc_average_influence_of_point(model, train_loader, test_loader, train_index, config, test_indices=None):
