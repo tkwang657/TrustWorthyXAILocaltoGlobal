@@ -35,7 +35,7 @@ def _to_scalar(x):
 def compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=-1,
                        damp=0.01, scale=25, recursion_depth=5000, r=1, eps=2e-4, patience=None):
     """Compute s_test (inverse-HVP * grad) for one test point."""
-    model.to(torch.device('cpu') if device == -1 else torch.device(f'cuda:{device}'))
+    model.to(torch.device('cpu') if device == -1 else torch.device(f'cuda:{config['device']}'))
     s_vec_list=[]
     for i in range(r):
         s_vec=s_test(z_test=z_test, t_test=t_test, model=model, z_loader=train_loader, device=device, damp=damp, scale=scale, recursion_depth=recursion_depth, eps=eps, patience=patience)
@@ -102,20 +102,22 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
     outdir = Path(config['outdir'])
     outdir.mkdir(exist_ok=True, parents=True)
     n_train=len(train_indices)
-    device = torch.device('cpu') if config['device'] == -1 else torch.device(f'cuda:{device}')
-    model.to(device)
     n_test=len(test_indices)
     influence_dict = {
     'train_id': [],
     'test_id': [],
     'influence': []
     }
+    devicename=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device=config['device']
+    starttime=datetime.datetime.now()
     for j in range(0, n_test):
         test_idx=test_indices[j]
+        timerstart=datetime.datetime.now()
         # Load precomputed s_test vector
         s_path = os.path.join(cachedir, f"s_test_{test_idx}.pt")
         assert os.path.isfile(s_path)
-        s_vec = torch.load(s_path, map_location=device)
+        s_vec = torch.load(s_path, map_location=devicename)
         s_vec_flat = torch.cat([p.flatten() for p in s_vec]).to(device)  # shape: (num_params,)
         # Process training set in batches
         for start_idx in range(0, n_train, batchsize):
@@ -130,11 +132,14 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
                 t_train = train_loader.collate_fn([t_train]).to(device)
                 grad_vec = grad_z(z_train, t_train, model, device=device)
                 grad_flat = torch.cat([g.flatten() for g in grad_vec]).to(device)
-                grads_flat_batch.append(grad_flat)
-                display_progress(f"Grads computed for train_idx in batch", train_idx, len(batch_indices))
+                logging.debug(f"Grads computed for train_idx {train_idx}")
+                nonfinite=not torch.isfinite(grad_flat).all()
+                if nonfinite:
+                    raise ValueError(f"Gradient of {train_idx} has exploding gradients")
+                else:
+                    grads_flat_batch.append(grad_flat)
             # Stack batch into matrix [batch_size x num_params]
             grads_batch = torch.stack(grads_flat_batch)  # shape: (batch, num_params)
-
             # Vectorized influence calculation: - grads @ s_test / n_train
             influence_vals = -(grads_batch @ s_vec_flat) / n_train  # shape: (batch,)
             influence_vals = influence_vals.detach().cpu().numpy()  # convert to numpy only once
@@ -147,8 +152,14 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
         tmp_path = Path(outdir) / f"influence_tmp_test_{test_idx}.pt"
         torch.save(influence_dict, tmp_path)
 
-
+        timerend=datetime.datetime.now()
+        elapsed=timerend-starttime
+        time_taken=timerend-timerstart
+        completed=j+1
+        remaining=(elapsed / completed) * (points - completed)
         display_progress(f"Influence computed for test_idx {test_idx}", j, n_test)
+        tqdm.write(f"Time for this test point {test_idx}: {format_time(str(time_taken.total_seconds()))} | "
+                   f"Elapsed: {format_time(str(elapsed.total_seconds()))} | ETA: {format_time(str(remaining.total_seconds()))}")
 
 
     final_path = Path(outdir) / "influence_results.pt" 
