@@ -203,7 +203,17 @@ class Entmax15(nn.Module):
     def forward(self, input):
         return entmax15(input, self.dim)
 
+class Entmax15Safe(nn.Module):
+    def __init__(self, dim=-1, use_softmax=False):
+        super().__init__()
+        self.dim = dim
+        self.use_softmax = use_softmax  # switch for influence
 
+    def forward(self, x):
+        if self.use_softmax:
+            return F.softmax(x, dim=self.dim)
+        else:
+            return entmax15(x, self.dim)
 # Credits were lost...
 # def _make_ix_like(input, dim=0):
 #     d = input.size(dim)

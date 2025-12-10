@@ -265,6 +265,7 @@ class LRSchedulerCallback(Callback):
         self,
     ):
         self.is_metric_related = hasattr(self.scheduler_fn, "is_better")
+        print(f"{self.scheduler_fn} has metric: {self.is_metric_related}")
         self.scheduler = self.scheduler_fn(self.optimizer, **self.scheduler_params)
         super().__init__()
 

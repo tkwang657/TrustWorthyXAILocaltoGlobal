@@ -6,6 +6,7 @@ from utils import display_progress
 import sys
 import logging as logging
 import os
+import numpy as np
 cur=os.getcwd()
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 influence_path = os.path.join(project_root, 'utilities', 'influence')
@@ -35,10 +36,13 @@ def s_test(z_test, t_test, model, z_loader, device=-1, damp=0.01, scale=25.0,
     #print(f"z_test: {z_test}, t_test: {t_test}")
     v = grad_z(z_test, t_test, model, device)
     h_estimate = [t.clone().detach() for t in v]
+    if any(torch.isnan(h).any() or torch.isinf(h).any() for h in h_estimate):
+        print("Some of h_estimate contains NaNs/infs")
     stoppingcounter=0
+    recurs_hist=[]
     for i in range(recursion_depth):
         # Get a new random minibatch each step
-        print(f"Recursion step {i} in s_test")
+        #print(f"Recursion step {i} in s_test")
         try:
             x, t = next(z_loader_iter)
         except NameError:
@@ -49,44 +53,43 @@ def s_test(z_test, t_test, model, z_loader, device=-1, damp=0.01, scale=25.0,
             x, t = next(z_loader_iter)
         if device >= 0:
             x, t = x.cuda(), t.cuda()
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            print(f"x has nans/infs")
-        if torch.isnan(t).any() or torch.isinf(t).any():
-            print(f"t has nans/infs")
+        # if torch.isnan(x).any() or torch.isinf(x).any():
+        #     print(f"x has nans/infs")
+        # if torch.isnan(t).any() or torch.isinf(t).any():
+        #     print(f"t has nans/infs")
         y = model(x)
-        if torch.isnan(y).any() or torch.isinf(y).any():
-            print(f"y has nans/infs")
+        # if torch.isnan(y).any() or torch.isinf(y).any():
+        #     print(f"y has nans/infs")
         loss = calc_loss(y, t)
-        if torch.isnan(loss).any() or torch.isinf(loss).any():
-            print(f"loss has nans/infs")
+        # if torch.isnan(loss).any() or torch.isinf(loss).any():
+        #     print(f"loss has nans/infs")
         params = [p for p in model.parameters() if p.requires_grad]
-        if any(torch.isnan(p).any() or torch.isinf(p).any() for p in params):
-            print("Some parameter contains NaNs/infs")
+        # if any(torch.isnan(p).any() or torch.isinf(p).any() for p in params):
+        #     print("Some parameter contains NaNs/infs")
         hv = hvp(loss, params, h_estimate)
-        if any(torch.isnan(h).any() or torch.isinf(h).any() for h in hv):
-            print("Some of hv contains NaNs/infs")
+        # if any(torch.isnan(h).any() or torch.isinf(h).any() for h in hv):
+        #     print("Some of hv contains NaNs/infs")
             #print(hv)
 
         # Update h_estimate without tracking gradients
         with torch.no_grad():
             h_new = [_v + (1 - damp) * _h_e - _hv / scale
                      for _v, _h_e, _hv in zip(v, h_estimate, hv)]
-
+            recurs_hist.append(torch.cat([h.flatten() for h in h_new]).cpu().numpy())
         # Optional: early stopping if h_estimate converges
-        delta = sum((_h_e - _h_n).norm() / (_h_e.norm() + 1e-9) for _h_e, _h_n in zip(h_estimate, h_new))
-        h_estimate = h_new
-
-        if any(torch.isnan(h).any() for h in h_estimate):
-            print("Some of h_estimate contains NaNs")
-        if patience is not None:
+        # if any(torch.isnan(h).any() for h in h_estimate):
+        #     print("Some of h_estimate contains NaNs")
+        if patience is not None and i>0:
+            delta = np.linalg.norm((recurs_hist[i] - recurs_hist[i-1])) /np.linalg.norm(recurs_hist[i-1])
             if delta<eps:
                 stoppingcounter+=1
                 if stoppingcounter >= patience:
-                    #print(f"Early stopping at recursion {i} after {patience} stable steps.")
-                    break
+                    print(f"Early stopping at recursion {i}.")
+                    break    
             else:
                 stoppingcounter=0
-        #display_progress("Calc. s_test recursions: ", i, recursion_depth, h_estimate)
+        h_estimate = h_new
+        display_progress("Calc. s_test recursions: ", i, recursion_depth, h_estimate)
     return h_estimate
 
 def calc_loss(y, t):
@@ -158,25 +161,25 @@ def hvp(y, w, v):
         ValueError: `y` and `w` have a different length."""
     if len(w) != len(v):
         raise(ValueError("w and v must have the same length."))
-    logging.info("hvp computation")
+    logging.debug("hvp computation")
     # First backprop
     first_grads = grad(y, w, retain_graph=True, create_graph=True, allow_unused=True)
     # Replace None gradients with zero tensors
     first_grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(first_grads, w)]
-    if any(torch.isnan(f).any() or torch.isinf(f).any() for f in first_grads):
-        print("Some of first_grads contains NaNs/infs")
+    # if any(torch.isnan(f).any() or torch.isinf(f).any() for f in first_grads):
+    #     print("Some of first_grads contains NaNs/infs")
     #print(f"first_grads: {first_grads}")
     # Elementwise products
     elemwise_products = 0
     for grad_elem, v_elem in zip(first_grads, v):
         elemwise_products += torch.sum(grad_elem * v_elem)
-    if torch.isnan(elemwise_products).any() or torch.isinf(elemwise_products).any():
-        print(f"elemwise_products has nans/infs")
-        print(elemwise_products)
+    # if torch.isnan(elemwise_products).any() or torch.isinf(elemwise_products).any():
+    #     print(f"elemwise_products has nans/infs")
+    #     print(f"elemwise_products: {elemwise_products}")
     # Second backprop
     return_grads = grad(elemwise_products, w, create_graph=True, allow_unused=True)
+    #print(f"return_grads: {return_grads}")
     return_grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(return_grads, w)]
-    if any(torch.isnan(g).any() or torch.isinf(g).any() for g in return_grads):
-        print("Some of return_grads contains NaNs/infs")
-        print(return_grads)
+    # if any(torch.isnan(f).any() or torch.isinf(f).any() for f in return_grads):
+    #     print("Some of return_grads contains NaNs/infs")
     return return_grads

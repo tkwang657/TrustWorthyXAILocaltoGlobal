@@ -39,29 +39,39 @@ def compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=
     s_vec_list=[]
     for i in range(r):
         s_vec=s_test(z_test=z_test, t_test=t_test, model=model, z_loader=train_loader, device=device, damp=damp, scale=scale, recursion_depth=recursion_depth)
-        display_progress("Averaging r-times: ", i, r)
+
         s_flat = torch.cat([s.flatten() for s in s_vec]).to(device)
         s_vec_list.append(s_flat)
+        display_progress("Averaging r-times: ", i, r)
     s_avg = torch.stack(s_vec_list).mean(dim=0)
-    print(f"Shape of s_vec: {s_avg.shape}")
+    # s_vec_list=[j.cpu().numpy() for j in s_vec_list]
+    # for i in range(1, r):
+    #     diff = np.linalg.norm(s_vec_list[i] - s_vec_list[i-1]) / np.linalg.norm(s_vec_list[i])
+    #     print(f"normed difference between round {i-1} ({np.linalg.norm(s_vec_list[i])}) and {i} (({np.linalg.norm(s_vec_list[i])}): {diff}")
     return s_avg
 
 
 
-def compute_influence_for_test_point(model, train_loader, test_loader, test_index, config, s_vec=None, time_logging=False):
-    """Return influences, harmful idxs, helpful idxs for a single test point over entire training set."""
+def compute_influence_for_test_point(model, train_loader, test_loader, test_index, config, train_ids=None, s_vec=None, time_logging=False):
+    """Return influences, harmful idxs, helpful idxs for a single test point over entire training set. influences is a dict that stores influence by the key influences[test_id][train_id]"""
     z_test, t_test = test_loader.dataset[test_index]
     if s_vec is None:
         z_test = test_loader.collate_fn([z_test])
         t_test = test_loader.collate_fn([t_test])
         s_vec = compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=config['device'], damp=config['damp'], scale=config['scale'], recursion_depth=config['recursion_depth'], r=config['r_averaging'])
-    n_train = len(train_loader.dataset)
-    influences = []
+    n_train=0
+    if train_ids is None:
+        n_train = len(train_loader.dataset)
+    else:
+        n_train=len(train_ids)
+    influences = {}
+    influences[test_index]={}
     device=torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     s_vec=s_vec.to(device)
     start=datetime.datetime.now()
     for i in range(n_train):
-        z_train, t_train = train_loader.dataset[i]
+        idx=train_ids[i]
+        z_train, t_train = train_loader.dataset[idx]
         z_train = train_loader.collate_fn([z_train])
         t_train = train_loader.collate_fn([t_train])
         if time_logging:
@@ -73,12 +83,12 @@ def compute_influence_for_test_point(model, train_loader, test_loader, test_inde
         if time_logging:
             time_b = datetime.datetime.now()
             time_delta = time_b - time_a
-            logging.debug(f"Time for single influence pair in ms:"f" {time_delta.total_seconds() * 1000}")
-        influences.append(influence_val)
+            logging.info(f"Time for gradz in seconds is:"f" {time_delta.total_seconds()}")
+        influences[test_index][idx]=influence_val
         display_progress("Calc. influence function: ", i, n_train)
     end=datetime.datetime.now()
     diff=end-start
-    logging.info(f"Time for dataset-influence of single test point:"f" {diff.total_seconds() * 1000}")
+    logging.info(f"Time for dataset-influence of single test point:"f" {diff.total_seconds()}")
     harmful = np.argsort(influences).tolist()
     helpful = harmful[::-1]
     return influences, harmful, helpful
@@ -148,12 +158,11 @@ def calc_influence_on_pair(model, train_loader, test_loader, train_id, test_id, 
     t_test = test_loader.collate_fn([t_test]).to(device)
 
     if s_vec is None:
-        s_vec = compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=gpu, damp=damp, scale=scale, recursion_depth=recursion_depth, r=r)
+        s_vec = compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=gpu, damp=damp, scale=scale, recursion_depth=recursion_depth, r=r, patience=5, eps=5e-4)
     s_vec = s_vec.to(device)
-    logging.info(f"S_vec for test point {test_id}: {s_vec}")
+    #logging.info(f"S_vec for test point {test_id}: {s_vec}}")
     grad_vec=grad_z(z_train, t_train, model, device=gpu)
     grad_vec = [g.to(device) for g in grad_vec] if isinstance(grad_vec, list) else grad_vec.to(device)
-    #logging.info(f"Grad_vec for train point {train_id}: {grad_vec}")
     influence_val = -sum(torch.sum(g * s).detach().cpu().item() for g, s in zip(grad_vec, s_vec))
     time_b=datetime.datetime.now()
     diff=time_b-time_a
