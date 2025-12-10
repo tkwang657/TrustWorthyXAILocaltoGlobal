@@ -70,9 +70,17 @@ class TabNetClassifier(TabModel):
         y_score = softmax(y_score, axis=1)
         return y_true, y_score
 
-    def predict_func(self, outputs):
-        outputs = np.argmax(outputs, axis=1)
-        return np.vectorize(self.preds_mapper.get)(outputs.astype(str))
+    def predict_func(self, outputs, threshold=0.5):
+        num_classes = outputs.shape[1]
+        if num_classes > 2:
+            outputs = np.argmax(outputs, axis=1)
+            return np.vectorize(self.preds_mapper.get)(outputs.astype(str))
+        else:
+            probs = softmax(outputs, axis=1)
+            p1 = probs[:, 1]
+            preds = (p1 >= threshold).astype(int)
+            return np.vectorize(self.preds_mapper.get)(preds.astype(str))
+
 
     def predict_proba(self, X):
         """

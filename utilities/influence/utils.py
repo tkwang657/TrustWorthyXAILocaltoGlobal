@@ -140,3 +140,17 @@ def get_default_config():
     print("gpu value in config:", config['device'])
 
     return config
+
+def format_time(seconds):
+    """Format seconds into H:M:S or M:S if less than 1 hour."""
+    seconds = float(seconds)
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    seconds="{:.2f}".format(s)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    elif m > 0:
+        return f"{m}m {s}s"
+    else:
+        return f"{s}s"

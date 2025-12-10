@@ -440,7 +440,7 @@ class TabModel(BaseEstimator):
         if self.compute_importance:
             # compute feature importance once the best model is defined
             self.feature_importances_ = self._compute_feature_importances(X_train)
-    def predict(self, X):
+    def predict(self, X, threshold=0.5):
         """
         Make predictions on a batch (valid)
 
@@ -476,7 +476,7 @@ class TabModel(BaseEstimator):
             predictions = output.cpu().detach().numpy()
             results.append(predictions)
         res = np.vstack(results)
-        return self.predict_func(res)
+        return self.predict_func(res, threshold=threshold)
 
     def explain(self, X, normalize=False):
         """

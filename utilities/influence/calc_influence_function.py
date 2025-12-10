@@ -21,7 +21,7 @@ if influence_path not in sys.path:
     sys.path.append(influence_path)
 
 from influence_function import s_test, grad_z  
-from utils import save_json, display_progress, get_default_config  
+from utils import save_json, display_progress, get_default_config, format_time
 
 
 def _to_scalar(x):
@@ -33,12 +33,12 @@ def _to_scalar(x):
 
 
 def compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=-1,
-                       damp=0.01, scale=25, recursion_depth=5000, r=1):
+                       damp=0.01, scale=25, recursion_depth=5000, r=1, eps=2e-4, patience=None):
     """Compute s_test (inverse-HVP * grad) for one test point."""
     model.to(torch.device('cpu') if device == -1 else torch.device(f'cuda:{device}'))
     s_vec_list=[]
     for i in range(r):
-        s_vec=s_test(z_test=z_test, t_test=t_test, model=model, z_loader=train_loader, device=device, damp=damp, scale=scale, recursion_depth=recursion_depth)
+        s_vec=s_test(z_test=z_test, t_test=t_test, model=model, z_loader=train_loader, device=device, damp=damp, scale=scale, recursion_depth=recursion_depth, eps=eps, patience=patience)
 
         s_flat = torch.cat([s.flatten() for s in s_vec]).to(device)
         s_vec_list.append(s_flat)
@@ -94,55 +94,67 @@ def compute_influence_for_test_point(model, train_loader, test_loader, test_inde
     return influences, harmful, helpful
 
 
-def calc_influence_batch(model, train_loader, test_loader, indices=None, config=None, cachedir=None):
+def load_stest_and_compute_batch_influence(model, train_loader, test_loader, test_indices=None, train_indices=None, config=None, cachedir=None, batchsize=512):
     """
     Compute influences for every test index in indices
     """
-    if config is None:
-        config = get_default_config()
 
     outdir = Path(config['outdir'])
     outdir.mkdir(exist_ok=True, parents=True)
-    if cachedir:
-        cachedir = Path(cachedir)
-        cachedir.mkdir(exist_ok=True, parents=True)
+    n_train=len(train_indices)
+    device = torch.device('cpu') if config['device'] == -1 else torch.device(f'cuda:{device}')
+    model.to(device)
+    n_test=len(test_indices)
+    influence_dict = {
+    'train_id': [],
+    'test_id': [],
+    'influence': []
+    }
+    for j in range(0, n_test):
+        test_idx=test_indices[j]
+        # Load precomputed s_test vector
+        s_path = os.path.join(cachedir, f"s_test_{test_idx}.pt")
+        assert os.path.isfile(s_path)
+        s_vec = torch.load(s_path, map_location=device)
+        s_vec_flat = torch.cat([p.flatten() for p in s_vec]).to(device)  # shape: (num_params,)
+        # Process training set in batches
+        for start_idx in range(0, n_train, batchsize):
+            end_idx = min(start_idx + batchsize, n_train)
+            batch_indices = [train_indices[j] for j in range(start_idx, end_idx)]
 
-    results = {}
-    test_len=0
-    if indices is None:
-        test_len = len(test_loader.dataset)
-        indices=list(range(len(test_loader.dataset)))
-    else:
-        test_len=len(indices)
+            # Compute gradients for the batch and vectorize
+            grads_flat_batch = []
+            for train_idx in batch_indices:
+                z_train, t_train = train_loader.dataset[train_idx]
+                z_train = train_loader.collate_fn([z_train]).to(device)
+                t_train = train_loader.collate_fn([t_train]).to(device)
+                grad_vec = grad_z(z_train, t_train, model, device=device)
+                grad_flat = torch.cat([g.flatten() for g in grad_vec]).to(device)
+                grads_flat_batch.append(grad_flat)
+                display_progress(f"Grads computed for train_idx in batch", train_idx, len(batch_indices))
+            # Stack batch into matrix [batch_size x num_params]
+            grads_batch = torch.stack(grads_flat_batch)  # shape: (batch, num_params)
 
-    for j in range(test_len):
-        start = time.time()
-        z_test, t_test = test_loader.dataset[indices[j]]
-        z_test = test_loader.collate_fn([z_test])
-        t_test = test_loader.collate_fn([t_test])
-        infl, harmful, helpful = compute_influence_for_test_point(
-            model, train_loader, test_loader=test_loader, test_index=indices[j], config=None
-        )
+            # Vectorized influence calculation: - grads @ s_test / n_train
+            influence_vals = -(grads_batch @ s_vec_flat) / n_train  # shape: (batch,)
+            influence_vals = influence_vals.detach().cpu().numpy()  # convert to numpy only once
+            assert influence_vals.shape[0] == grads_batch.shape[0], f"Expected influence_vals length {grads_batch.shape[0]}, got {influence_vals.shape[0]}"
+            # Store in dictionary
+            for train_idx, infl_val in zip(batch_indices, influence_vals):
+                influence_dict['train_id'].append(train_idx)
+                influence_dict['test_id'].append(test_idx)
+                influence_dict['influence'].append(infl_val)
+        tmp_path = Path(outdir) / f"influence_tmp_test_{test_idx}.pt"
+        torch.save(influence_dict, tmp_path)
 
-        # Convert everything to JSON-friendly types
-        infl_json = [_to_scalar(v) for v in infl]
-        results[str(j)] = {
-            "label": _to_scalar(t_test[0]),
-            "num_in_dataset": indices[j],
-            "time_calc_influence_s": time.time() - start,
-            "influence": infl_json,
-            "harmful": [int(x) for x in harmful],
-            "helpful": [int(x) for x in helpful],
-        }
 
-        tmp_path = outdir / f"influence_results_tmp_last-i_{j}.json"
-        save_json(results, tmp_path)
-        display_progress("Test samples processed: ", j, test_len)
+        display_progress(f"Influence computed for test_idx {test_idx}", j, n_test)
 
-    final_path = outdir / "influence_results.json"
-    save_json(results, final_path)
+
+    final_path = Path(outdir) / "influence_results.pt" 
+    torch.save(influence_dict, final_path)
     logging.info(f"Saved influence results to {final_path}")
-    return results
+    return influence_dict
 
 
 def calc_influence_on_pair(model, train_loader, test_loader, train_id, test_id, s_vec=None, device=-1, damp=0.01, scale=25, recursion_depth=5000, r=10):
@@ -183,5 +195,54 @@ def calc_average_influence_of_point(model, train_loader, test_loader, train_inde
         total_influence+=inf
     avg_influence = total_influence / len(test_indices)
     return avg_influence
+
+import json
+from tqdm import tqdm
+def precompute_s_tests(model, test_loader, train_loader, test_ids, config, out_dir="s_test_cache", eps=2e-4, patience=None):
+    """
+    Precompute s_test vectors for *every* test example and save them individually.
+    - Uses streaming saves to avoid loading everything in RAM.
+    - Supports FP16 to reduce disk usage (optional).
+    - Auto-resumes if some s_test files already generated.
+    """
+    devicename=torch.device('cpu') if config['device'] == -1 else torch.device(f'cuda:{config["device"]}')
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    s_meta = {
+        "recursion_depth": config['recursion_depth'],
+        "r_avg": config['r_averaging'],
+        "damping": config['damp'],
+        "scale": config['scale'],
+        "num_params": sum(p.numel() for p in model.parameters()),
+    }
+    json.dump(s_meta, open(os.path.join(out_dir, "meta.json"), "w"), indent=2)
+    points=len(test_ids)
+    start_time=datetime.datetime.now()
+    for i in range(points):
+        timerstart=datetime.datetime.now()
+        idx=test_ids[i]
+        out_path = os.path.join(out_dir, f"s_test_{idx}.pt")
+        # Skip if already computed (smart resume)
+        if os.path.isfile(out_path):
+            tqdm.write(f"[skip] s_test for idx {idx} already exists.")
+            continue
+
+        logging.info(f"[compute] s_test for idx {idx}")
+        z_test, t_test = train_loader.dataset[idx]
+        z_test = test_loader.collate_fn([z_test]).to(devicename)
+        t_test = test_loader.collate_fn([t_test]).to(devicename)
+        s_test_single=compute_s_test_vector_for_point(model=model, z_test=z_test, t_test=t_test, train_loader=train_loader, device=config['device'], damp=config['damp'], scale=config['scale'], recursion_depth=config['recursion_depth'], r=config['r_averaging'], eps=eps, patience=patience)
+        # Save a single s_test vector → extremely safe for large param count (131k+)
+        print(f"All finite: {torch.isfinite(s_test_single).any().item()}")
+        torch.save(s_test_single, out_path)
+        timer_end=datetime.datetime.now()
+        time_taken=timer_end-timerstart
+        elapsed = timer_end - start_time
+        completed = i + 1
+        remaining = (elapsed / completed) * (points - completed)
+        tqdm.write(f"Time for this s_test: {format_time(str(time_taken.total_seconds()))} | "
+                   f"Elapsed: {format_time(str(elapsed.total_seconds()))} | ETA: {format_time(str(remaining.total_seconds()))}")
+        display_progress("Precomputing s_test", i, points, enabled=True, fix_zero_start=False)
+    print(f"Completed s_test precomputation. Saved to {out_dir}/")
 
 

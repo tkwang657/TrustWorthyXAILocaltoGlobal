@@ -1,7 +1,7 @@
 from torch import nn
 from torch.autograd import Function
 import torch.nn.functional as F
-
+import sys
 import torch
 
 """
@@ -131,14 +131,42 @@ class Entmax15Function(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        grad_output=torch.clamp(grad_output, min=-1e4, max=1e4)
+        if torch.isnan(grad_output).any().item():
+            print(f"grad_output has NaNs")
+            print(grad_output)
+            sys.exit(-1)
         Y, = ctx.saved_tensors
+        if torch.isnan(Y).any().item():
+            print("Y has Nans")
+            print(Y)
+            sys.exit(-1)
         gppr = Y.sqrt()  # = 1 / g'' (Y)
+        if torch.isnan(gppr).any().item():
+            print('gppr has nans')
+            print(gppr)
+            sys.exit(-1)
         dX = grad_output * gppr
-        q = dX.sum(ctx.dim) / gppr.sum(ctx.dim)
+        if torch.isnan(dX).any().item():
+            print('dX before q has nans')
+            print(dX)
+            print("gradoutput")
+            print(grad_output)
+            print("gppr")
+            print(gppr)
+            sys.exit(-1)
+        q = dX.sum(ctx.dim) / (gppr.sum(ctx.dim)+1e-12)
+        if torch.isnan(q).any().item():
+            print('q has nans')
+            print(q)
+            sys.exit(-1)
         q = q.unsqueeze(ctx.dim)
         dX -= q * gppr
+        if torch.isnan(dX).any().item():
+            print('dX after qhas nans')
+            print(dX)
+            sys.exit(-1)
         return dX, None
-
     @staticmethod
     def _threshold_and_support(input, dim=-1):
         Xsrt, _ = torch.sort(input, descending=True, dim=dim)
