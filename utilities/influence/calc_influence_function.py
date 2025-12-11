@@ -101,72 +101,73 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
 
     outdir = Path(config['outdir'])
     outdir.mkdir(exist_ok=True, parents=True)
+    outfile=outdir /"influences.csv"
+    
     n_train=len(train_indices)
     n_test=len(test_indices)
-    influence_dict = {
-    'train_id': [],
-    'test_id': [],
-    'influence': []
-    }
+    svec_cache={}
+    batchcount=0
+    
     devicename=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     device=config['device']
     starttime=datetime.datetime.now()
-    svec_cache={}
-    n_test=len(test_indices)
-    n_train=len(train_indices)
-    batchcount=0
-    for start_idx in range(0, n_train, batchsize):
-        time_a=datetime.datetime.now()
-        batchcount+=1
-        end_idx = min(start_idx + batchsize, n_train)
-        batch_indices = [train_indices[i] for i in range(start_idx, end_idx)]
-        grads_flat_batch = []
-        for train_idx in batch_indices:
-            z_train, t_train = train_loader.dataset[train_idx]
-            z_train = train_loader.collate_fn([z_train]).to(device)
-            t_train = train_loader.collate_fn([t_train]).to(device)
-            grad_vec = grad_z(z_train, t_train, model, device=device)
-            grad_flat = torch.cat([g.flatten() for g in grad_vec]).to(device)
-            grads_flat_batch.append(grad_flat)
-        # Stack batch into matrix [batch_size x num_params]
-        grads_batch = torch.stack(grads_flat_batch)  # shape: (batch, num_params)
-        logging.info(f"Grads for batch {batchcount} done")
-        for j in range(n_test):
-            test_idx=test_indices[j]
-            if test_idx in svec_cache:
-                s_vec_flat=svec_cache[test_idx]
-            else:
-                timerstart=datetime.datetime.now()
-                # Load precomputed s_test vector
-                s_path = os.path.join(cachedir, f"s_test_{test_idx}.pt")
-                assert os.path.isfile(s_path), f"File path given: {s_path}"
-                s_vec = torch.load(s_path, map_location=devicename)
-                s_vec_flat = torch.cat([p.flatten() for p in s_vec]).to(device)  # shape: (num_params,)
-                svec_cache[test_idx]=s_vec_flat
-            # Vectorized influence calculation: - grads @ s_test / n_train
-            influence_vals = -(grads_batch @ s_vec_flat) / n_train  # shape: (batch,)
-            influence_vals = influence_vals.detach().cpu().numpy()  # convert to numpy only once
-            assert influence_vals.shape[0] == grads_batch.shape[0], f"Expected influence_vals length {grads_batch.shape[0]}, got {influence_vals.shape[0]}"
-            for i in range(len(batch_indices)):
-                save_dir = Path(outdir) / f"influence_cache/test_{test_idx}"
-                save_dir.mkdir(parents=True, exist_ok=True)
-                save_path = save_dir / f"{batch_indices[i]}.pt"
-                torch.save(influence_vals[i], save_path)
-                influence_dict['train_id'].append(batch_indices[i])
-                influence_dict['test_id'].append(test_idx)
-                influence_dict['influence'].append(influence_vals[i])
-
-        timerend=datetime.datetime.now()
-        elapsed=timerend-starttime
-        time_taken=timerend-time_a
-        remaining=(elapsed / batchcount) * ((n_train//batchsize +1) - batchcount)
-        display_progress(f"Influence computed for Batch {batchcount}", batchcount, n_train//batchsize +1)
-        tqdm.write(f"Time Taken: {format_time(str(time_taken.total_seconds()))} | Elapsed: {format_time(str(elapsed.total_seconds()))} | ETA: {format_time(str(remaining.total_seconds()))}")
-
-
-    final_path = Path(outdir) / "influence_results.pt" 
-    torch.save(influence_dict, final_path)
-    logging.info(f"Saved influence results to {final_path}")
+    computed_pairs = set()
+    if outfile.exists():
+        with open(outfile, "r") as f:
+            reader = csv.reader(f)
+            next(reader)  # skip header
+            for row in reader:
+                train_id, test_id, _ = row
+                computed_pairs.add((int(train_id), int(test_id)))
+    with open(outfile, "w") as f:
+        f.write("train_id,test_id,influence\n")
+        for start_idx in range(0, n_train, batchsize):
+            time_a=datetime.datetime.now()
+            batchcount+=1
+            end_idx = min(start_idx + batchsize, n_train)
+            batch_indices = [train_indices[i] for i in range(start_idx, end_idx)]
+            
+            grads_flat_batch = []
+            for train_idx in batch_indices:
+                z_train, t_train = train_loader.dataset[train_idx]
+                z_train = train_loader.collate_fn([z_train]).to(device)
+                t_train = train_loader.collate_fn([t_train]).to(device)
+                grad_vec = grad_z(z_train, t_train, model, device=device)
+                grad_flat = torch.cat([g.flatten() for g in grad_vec]).to(device)
+                grads_flat_batch.append(grad_flat)
+                
+            # Stack batch into matrix [batch_size x num_params]
+            grads_batch = torch.stack(grads_flat_batch)  # shape: (batch, num_params)
+            tqdm.write(f"Grads for batch {batchcount}/{(n_train//batchsize+1)} done")
+            
+            for j in range(n_test):
+                test_idx=test_indices[j]
+                if test_idx in svec_cache:
+                    s_vec_flat=svec_cache[test_idx]
+                else:
+                    timerstart=datetime.datetime.now()
+                    # Load precomputed s_test vector
+                    s_path = os.path.join(cachedir, f"s_test_{test_idx}.pt")
+                    assert os.path.isfile(s_path), f"File path given: {s_path}"
+                    s_vec = torch.load(s_path, map_location=devicename)
+                    s_vec_flat = torch.cat([p.flatten() for p in s_vec]).to(device)  # shape: (num_params,)
+                    svec_cache[test_idx]=s_vec_flat
+                # Vectorized influence calculation: - grads @ s_test / n_train
+                influence_vals = -(grads_batch @ s_vec_flat) / n_train  # shape: (batch,)
+                influence_vals = influence_vals.detach().cpu().numpy()  # convert to numpy only once
+                assert influence_vals.shape[0] == grads_batch.shape[0], f"Expected influence_vals length {grads_batch.shape[0]}, got {influence_vals.shape[0]}"
+                print(f"Influence_vals shape: {influence_vals.shape()}, {influence_vals}")
+                for train_idx, infl in zip(batch_indices, influence_vals):
+                    if (train_idx, test_idx) in computed_pairs:
+                        continue
+                    f.write(f"{train_idx},{test_idx},{infl}\n")
+            timerend=datetime.datetime.now()
+            elapsed=timerend-starttime
+            time_taken=timerend-time_a
+            remaining=(elapsed / batchcount) * ((n_train//batchsize +1) - batchcount)
+            display_progress(f"Influence computed for Batch {batchcount}", batchcount, n_train//batchsize +1)
+            tqdm.write(f"Time Taken: {format_time(str(time_taken.total_seconds()))} | Elapsed: {format_time(str(elapsed.total_seconds()))} | ETA: {format_time(str(remaining.total_seconds()))}")
+    loggin.info("Influence Computation complete")
     return influence_dict
 
 
