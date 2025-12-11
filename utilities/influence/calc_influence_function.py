@@ -194,27 +194,6 @@ def calc_influence_on_pair(model, train_loader, test_loader, train_id, test_id, 
     diff=time_b-time_a
     logging.info("Influence of single z_train z-test pair:"f" {(train_id, test_id)} : {influence_val}. Time: {diff.total_seconds()} seconds")
     return influence_val
-
-def calc_total_influence_of_points_from_csv(csv_path):
-    """
-    Compute the total influence of a single training point across all provided test points.
-    Returns a single scalar (sum of influences).
-    """
-    
-    if not os.path.isfile(csv_path):
-        raise FileNotFoundError(f"CSV file not found: {csv_path}")
-    influences = {}
-    with open(csv_path, newline='', encoding='utf-8-sig') as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            train_id=int(row['train_id'])
-            infl_val=float(row['influence'])
-            if train_id in influences:
-                influences[train_id].append(infl_val)
-            else:
-                influences[train_id]=[infl_val]
-    total_influences = {train_id: sum(vals)/len(vals) for train_id, vals in influences.items()}
-    return total_influences
     
 
 
