@@ -111,55 +111,57 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
     devicename=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     device=config['device']
     starttime=datetime.datetime.now()
-    for j in range(0, n_test):
-        test_idx=test_indices[j]
-        timerstart=datetime.datetime.now()
-        # Load precomputed s_test vector
-        s_path = os.path.join(cachedir, f"s_test_{test_idx}.pt")
-        assert os.path.isfile(s_path)
-        s_vec = torch.load(s_path, map_location=devicename)
-        s_vec_flat = torch.cat([p.flatten() for p in s_vec]).to(device)  # shape: (num_params,)
-        # Process training set in batches
-        for start_idx in range(0, n_train, batchsize):
-            end_idx = min(start_idx + batchsize, n_train)
-            batch_indices = [train_indices[j] for j in range(start_idx, end_idx)]
-
-            # Compute gradients for the batch and vectorize
-            grads_flat_batch = []
-            for train_idx in batch_indices:
-                z_train, t_train = train_loader.dataset[train_idx]
-                z_train = train_loader.collate_fn([z_train]).to(device)
-                t_train = train_loader.collate_fn([t_train]).to(device)
-                grad_vec = grad_z(z_train, t_train, model, device=device)
-                grad_flat = torch.cat([g.flatten() for g in grad_vec]).to(device)
-                logging.debug(f"Grads computed for train_idx {train_idx}")
-                nonfinite=not torch.isfinite(grad_flat).all()
-                if nonfinite:
-                    raise ValueError(f"Gradient of {train_idx} has exploding gradients")
-                else:
-                    grads_flat_batch.append(grad_flat)
-            # Stack batch into matrix [batch_size x num_params]
-            grads_batch = torch.stack(grads_flat_batch)  # shape: (batch, num_params)
+    svec_cache={}
+    n_test=len(test_indices)
+    n_train=len(train_indices)
+    batchcount=0
+    for start_idx in range(0, n_train, batchsize):
+        time_a=datetime.datetime.now()
+        batchcount+=1
+        end_idx = min(start_idx + batchsize, n_train)
+        batch_indices = [train_indices[i] for i in range(start_idx, end_idx)]
+        grads_flat_batch = []
+        for train_idx in batch_indices:
+            z_train, t_train = train_loader.dataset[train_idx]
+            z_train = train_loader.collate_fn([z_train]).to(device)
+            t_train = train_loader.collate_fn([t_train]).to(device)
+            grad_vec = grad_z(z_train, t_train, model, device=device)
+            grad_flat = torch.cat([g.flatten() for g in grad_vec]).to(device)
+            grads_flat_batch.append(grad_flat)
+        # Stack batch into matrix [batch_size x num_params]
+        grads_batch = torch.stack(grads_flat_batch)  # shape: (batch, num_params)
+        logging.info(f"Grads for batch {batchcount} done")
+        for j in range(n_test):
+            test_idx=test_indices[j]
+            if test_idx in svec_cache:
+                s_vec_flat=svec_cache[test_idx]
+            else:
+                timerstart=datetime.datetime.now()
+                # Load precomputed s_test vector
+                s_path = os.path.join(cachedir, f"s_test_{test_idx}.pt")
+                assert os.path.isfile(s_path), f"File path given: {s_path}"
+                s_vec = torch.load(s_path, map_location=devicename)
+                s_vec_flat = torch.cat([p.flatten() for p in s_vec]).to(device)  # shape: (num_params,)
+                svec_cache[test_idx]=s_vec_flat
             # Vectorized influence calculation: - grads @ s_test / n_train
             influence_vals = -(grads_batch @ s_vec_flat) / n_train  # shape: (batch,)
             influence_vals = influence_vals.detach().cpu().numpy()  # convert to numpy only once
             assert influence_vals.shape[0] == grads_batch.shape[0], f"Expected influence_vals length {grads_batch.shape[0]}, got {influence_vals.shape[0]}"
-            # Store in dictionary
-            for train_idx, infl_val in zip(batch_indices, influence_vals):
-                influence_dict['train_id'].append(train_idx)
+            for i in range(len(batch_indices)):
+                save_dir = Path(outdir) / f"influence_cache/test_{test_idx}"
+                save_dir.mkdir(parents=True, exist_ok=True)
+                save_path = save_dir / f"{batch_indices[i]}.pt"
+                torch.save(influence_vals[i], save_path)
+                influence_dict['train_id'].append(batch_indices[i])
                 influence_dict['test_id'].append(test_idx)
-                influence_dict['influence'].append(infl_val)
-        tmp_path = Path(outdir) / f"influence_tmp_test_{test_idx}.pt"
-        torch.save(influence_dict, tmp_path)
+                influence_dict['influence'].append(influence_vals[i])
 
         timerend=datetime.datetime.now()
         elapsed=timerend-starttime
-        time_taken=timerend-timerstart
-        completed=j+1
-        remaining=(elapsed / completed) * (points - completed)
-        display_progress(f"Influence computed for test_idx {test_idx}", j, n_test)
-        tqdm.write(f"Time for this test point {test_idx}: {format_time(str(time_taken.total_seconds()))} | "
-                   f"Elapsed: {format_time(str(elapsed.total_seconds()))} | ETA: {format_time(str(remaining.total_seconds()))}")
+        time_taken=timerend-time_a
+        remaining=(elapsed / batchcount) * ((n_train//batchsize +1) - batchcount)
+        display_progress(f"Influence computed for Batch {batchcount}", batchcount, n_train//batchsize +1)
+        tqdm.write(f"Time Taken: {format_time(str(time_taken.total_seconds()))} | Elapsed: {format_time(str(elapsed.total_seconds()))} | ETA: {format_time(str(remaining.total_seconds()))}")
 
 
     final_path = Path(outdir) / "influence_results.pt" 

@@ -265,7 +265,7 @@ class TabModel(BaseEstimator):
             self._callback_container.on_epoch_end(
                 epoch_idx, logs=self.history.epoch_metrics
             )
-
+            self.save_model(f"models_/epoch_{epoch_idx}")
             if self._stop_training:
                 break
 
@@ -423,7 +423,7 @@ class TabModel(BaseEstimator):
             self._callback_container.on_epoch_end(
                 epoch_idx, logs=self.history.epoch_metrics
             )
-
+            self.save_model(f"models_/epoch_{epoch_idx}")
             if self.compute_importance and len(valid_dataloaders)>0:
                 tmp=self._compute_feature_importances(X_train)
                 print(tmp)
@@ -655,7 +655,6 @@ class TabModel(BaseEstimator):
 
         epoch_logs = {"lr": self._optimizer.param_groups[-1]["lr"]}
         self.history.epoch_metrics.update(epoch_logs)
-
         return
 
     def _train_batch(self, X, y):
