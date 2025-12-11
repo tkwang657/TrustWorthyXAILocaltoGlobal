@@ -154,3 +154,28 @@ def format_time(seconds):
         return f"{m}m {s}s"
     else:
         return f"{s}s"
+    
+import csv
+from collections import defaultdict
+def count_harmful_positive_per_test(csv_path):
+    """
+    Returns a dictionary:
+    { test_id: {'positive': count, 'negative': count} }
+    """
+    csv_path = Path(csv_path)
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    counts_per_test = defaultdict(lambda: {'positive': 0, 'negative': 0})
+
+    with open(csv_path, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            test_id = int(row['test_id'])
+            influence = float(row['influence'])
+            if influence >= 0:
+                counts_per_test[test_id]['positive'] += 1
+            else:
+                counts_per_test[test_id]['negative'] += 1
+
+    return dict(counts_per_test)

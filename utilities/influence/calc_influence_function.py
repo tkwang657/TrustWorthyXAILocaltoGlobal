@@ -35,7 +35,7 @@ def _to_scalar(x):
 def compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=-1,
                        damp=0.01, scale=25, recursion_depth=5000, r=1, eps=2e-4, patience=None):
     """Compute s_test (inverse-HVP * grad) for one test point."""
-    model.to(torch.device('cpu') if device == -1 else torch.device(f'cuda:{config['device']}'))
+    model.to(torch.device('cpu') if device == -1 else torch.device(f'cuda:0'))
     s_vec_list=[]
     for i in range(r):
         s_vec=s_test(z_test=z_test, t_test=t_test, model=model, z_loader=train_loader, device=device, damp=damp, scale=scale, recursion_depth=recursion_depth, eps=eps, patience=patience)
@@ -138,7 +138,7 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
                 
             # Stack batch into matrix [batch_size x num_params]
             grads_batch = torch.stack(grads_flat_batch)  # shape: (batch, num_params)
-            tqdm.write(f"Grads for batch {batchcount}/{(n_train//batchsize+1)} done")
+            tqdm.write(f"Grads for batch {batchcount}/{(n_train//batchsize+1)} done | Time Taken: {(datetime.datetime.now()-time_a).total_seconds()}")
             
             for j in range(n_test):
                 test_idx=test_indices[j]
@@ -156,7 +156,7 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
                 influence_vals = -(grads_batch @ s_vec_flat) / n_train  # shape: (batch,)
                 influence_vals = influence_vals.detach().cpu().numpy()  # convert to numpy only once
                 assert influence_vals.shape[0] == grads_batch.shape[0], f"Expected influence_vals length {grads_batch.shape[0]}, got {influence_vals.shape[0]}"
-                print(f"Influence_vals shape: {influence_vals.shape()}, {influence_vals}")
+                print(f"Influence_val for test_id {test_idx} shape: {influence_vals.shape}, {influence_vals}")
                 for train_idx, infl in zip(batch_indices, influence_vals):
                     if (train_idx, test_idx) in computed_pairs:
                         continue
@@ -167,8 +167,8 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
             remaining=(elapsed / batchcount) * ((n_train//batchsize +1) - batchcount)
             display_progress(f"Influence computed for Batch {batchcount}", batchcount, n_train//batchsize +1)
             tqdm.write(f"Time Taken: {format_time(str(time_taken.total_seconds()))} | Elapsed: {format_time(str(elapsed.total_seconds()))} | ETA: {format_time(str(remaining.total_seconds()))}")
-    loggin.info("Influence Computation complete")
-    return influence_dict
+    logging.info("Influence Computation complete")
+    return True
 
 
 def calc_influence_on_pair(model, train_loader, test_loader, train_id, test_id, s_vec=None, device=-1, damp=0.01, scale=25, recursion_depth=5000, r=10):
@@ -195,20 +195,28 @@ def calc_influence_on_pair(model, train_loader, test_loader, train_id, test_id, 
     logging.info("Influence of single z_train z-test pair:"f" {(train_id, test_id)} : {influence_val}. Time: {diff.total_seconds()} seconds")
     return influence_val
 
-def calc_average_influence_of_point(model, train_loader, test_loader, train_index, config, test_indices=None):
+def calc_total_influence_of_points_from_csv(csv_path):
     """
-    Compute the average influence of a single training point across all provided test points.
+    Compute the total influence of a single training point across all provided test points.
     Returns a single scalar (sum of influences).
     """
-    if test_indices is None:
-        test_indices = list(range(len(test_loader.dataset)))
     
-    total_influence = 0.0
-    for test_idx in test_indices:
-        inf=calc_influence_on_pair(model=model, train_loader=train_loader, test_loader=test_loader, train_id=train_index, test_id=test_idx, device=config['device'], damp=config['damp'], scale=config['scale'], recursion_depth=config['recursion_depth'], r=config['r_averaging'])
-        total_influence+=inf
-    avg_influence = total_influence / len(test_indices)
-    return avg_influence
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+    influences = {}
+    with open(csv_path, newline='', encoding='utf-8-sig') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            train_id=int(row['train_id'])
+            infl_val=float(row['influence'])
+            if train_id in influences:
+                influences[train_id].append(infl_val)
+            else:
+                influences[train_id]=[infl_val]
+    total_influences = {train_id: sum(vals)/len(vals) for train_id, vals in influences.items()}
+    return total_influences
+    
+
 
 import json
 from tqdm import tqdm

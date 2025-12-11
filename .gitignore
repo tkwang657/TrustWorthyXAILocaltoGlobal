@@ -210,3 +210,4 @@ __marimo__/
 datasets/*
 .myenv/
 500ktest_dataset_lar.csv
+training/outdir/influences.csv
