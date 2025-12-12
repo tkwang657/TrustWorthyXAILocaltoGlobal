@@ -134,26 +134,36 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
     starttime=datetime.datetime.now()
     computed_pairs = set()
     if outfile.exists():
-        df = pd.read_csv(outfile, skiprows=1, header=None, names=['train_id', 'test_id', '_'])
+        df = pd.read_csv(outfile, skiprows=1, header=None, names=['train_id', 'test_id', 'influences'])
         computed_pairs = set(zip(df['train_id'].astype(int), df['test_id'].astype(int)))
-        print(f"Already computed {len(computed_pairs)} pairs.")
-    with open(outfile, "w") as f:
-        f.write("train_id,test_id,influence\n")
+        print(len(computed_pairs))
+        
+    with open(outfile, "a") as f:
+        if not outfile.exists():
+            f.write("train_id,test_id,influence\n")
         for start_idx in range(0, n_train, batchsize):
-            time_a=datetime.datetime.now()
-            batchcount+=1
             end_idx = min(start_idx + batchsize, n_train)
             batch_indices = [train_indices[i] for i in range(start_idx, end_idx)]
+            batch_df = df[df['train_id'].isin(batch_indices)]
+            batch_computation_counts = batch_df['train_id'].value_counts().to_dict()
+            time_a=datetime.datetime.now()
+            batchcount+=1
+        
             
             grads_flat_batch = []
             for train_idx in batch_indices:
+                if batch_computation_counts.get(train_idx, 0)==n_test:
+                    tqdm.write(f"Skipping train_idx {train_idx} as it has been fully computed for all test points.")
+                    continue
+
                 z_train, t_train = train_loader.dataset[train_idx]
                 z_train = train_loader.collate_fn([z_train]).to(target_device)
                 t_train = train_loader.collate_fn([t_train]).to(target_device)
                 grad_vec = grad_z(z_train, t_train, model, device=device_id)
                 grad_flat = torch.cat([g.flatten() for g in grad_vec]).to(target_device)
                 grads_flat_batch.append(grad_flat)
-                
+            if len(grads_flat_batch)==0:
+                continue
             # Stack batch into matrix [batch_size x num_params]
             grads_batch = torch.stack(grads_flat_batch)  # shape: (batch, num_params)
             tqdm.write(f"Grads for batch {batchcount}/{(n_train//batchsize+1)} done | Time Taken: {(datetime.datetime.now()-time_a).total_seconds()}")
@@ -161,9 +171,8 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
             for j in range(n_test):
                 test_idx=test_indices[j]
                 if test_idx in svec_cache:
-                    s_vec_flat=svec_cache[test_idx]
+                    s_vec_flat = svec_cache[test_idx]
                 else:
-                    timerstart=datetime.datetime.now()
                     # Load precomputed s_test vector
                     s_path = os.path.join(cachedir, f"s_test_{test_idx}.pt")
                     assert os.path.isfile(s_path), f"File path given: {s_path}"
@@ -178,7 +187,9 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
                 for train_idx, infl in zip(batch_indices, influence_vals):
                     if (train_idx, test_idx) in computed_pairs:
                         continue
-                    f.write(f"{train_idx},{test_idx},{infl}\n")
+                    else:
+                        f.write(f"{train_idx},{test_idx},{infl}\n")
+                        computed_pairs.add((train_idx, test_idx))
             timerend=datetime.datetime.now()
             elapsed=timerend-starttime
             time_taken=timerend-time_a
