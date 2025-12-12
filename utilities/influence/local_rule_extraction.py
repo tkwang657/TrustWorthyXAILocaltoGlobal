@@ -10,10 +10,12 @@ global rules
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
-from sklearn.tree import DecisionTreeClassifier, export_text
+from sklearn.tree import DecisionTreeClassifier, export_text, plot_tree
 from sklearn.cluster import KMeans, DBSCAN
 from sklearn.preprocessing import StandardScaler
 import torch
+import matplotlib.pyplot as plt
+from matplotlib import pyplot
 
 
 class LocalRuleExtractor:
@@ -43,6 +45,45 @@ class LocalRuleExtractor:
         self.min_samples_split = min_samples_split
         self.model.eval()
     
+    def get_influential_samples_from_csv(self, csv_path: str, test_id: int,
+                                         top_k: int = 50) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Step 1: Identify influential training samples from CSV file.
+        
+        Args:
+            csv_path: Path to CSV file with columns: train_id, test_id, influence
+            test_id: Test sample ID
+            top_k: Number of top helpful/harmful samples to consider
+            
+        Returns:
+            helpful_indices: Indices of helpful samples in training set
+            harmful_indices: Indices of harmful samples in training set
+            helpful_influences: Influence values for helpful samples
+            harmful_influences: Influence values for harmful samples
+        """
+        # Load CSV
+        df = pd.read_csv(csv_path)
+        
+        # Filter for this test_id
+        test_df = df[df['test_id'] == test_id].copy()
+        
+        if len(test_df) == 0:
+            raise ValueError(f"No influences found for test_id {test_id} in CSV")
+        
+        # Sort by influence and get top helpful (positive) and harmful (negative)
+        test_df = test_df.sort_values('influence', ascending=False)
+        
+        # Get helpful (positive influence) and harmful (negative influence)
+        helpful_df = test_df[test_df['influence'] > 0].head(top_k)
+        harmful_df = test_df[test_df['influence'] < 0].tail(top_k)
+        
+        helpful_indices = helpful_df['train_id'].values.astype(int)
+        harmful_indices = harmful_df['train_id'].values.astype(int)
+        helpful_influences = helpful_df['influence'].values
+        harmful_influences = harmful_df['influence'].values
+        
+        return helpful_indices, harmful_indices, helpful_influences, harmful_influences
+    
     def get_influential_samples(self, influence_results: Dict, test_id: int, 
                                 top_k: int = 50) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -62,10 +103,10 @@ class LocalRuleExtractor:
         if str(test_id) not in influence_results:
             raise ValueError(f"Test ID {test_id} not found in influence_results")
         
-        result = influence_results[str(test_id)]
-        influences = np.array(result['influence'])
-        helpful_indices = np.array(result['helpful'][:top_k])
-        harmful_indices = np.array(result['harmful'][:top_k])
+        result = influence_results[str(test_id)] 
+        influences = np.array(result['influence']) # influence of each training point
+        helpful_indices = np.array(result['helpful'][:top_k]) # most helpful training points
+        harmful_indices = np.array(result['harmful'][:top_k]) # most harmful training points
         
         return helpful_indices, harmful_indices, influences[helpful_indices], influences[harmful_indices]
     
@@ -199,47 +240,62 @@ class LocalRuleExtractor:
         
         # Extract explanation rule (most common prediction path)
         most_common_label = np.bincount(cluster_labels).argmax()
-        explanation_rule = self._extract_rule_from_tree(tree, cluster_features, 
-                                                      most_common_label, 
-                                                      is_explanation=True)
+        
+        # Use comprehensive rule extraction with multiple fallback strategies
+        explanation_rule = self._extract_rule_comprehensive(
+            tree, cluster_features, cluster_labels, most_common_label
+        )
         
         # Find counterfactual: nearest cluster with different dominant label
-        counterfactual_rule = self._find_counterfactual_rule(
-            cluster_data, cluster_id, cluster_features, most_common_label,
-            X_train, y_train
-        )
+        counterfactual_rule = None
+        try:
+            counterfactual_rule = self._find_counterfactual_rule(
+                cluster_data, cluster_id, cluster_features, most_common_label,
+                X_train, y_train
+            )
+        except (ValueError, AttributeError):
+            pass  # Counterfactual is optional
         
         return {
             'cluster_id': cluster_id,
             'n_samples': cluster_mask.sum(),
-            'dominant_label': most_common_label,
-            'mean_influence': cluster_influences.mean(),
+            'dominant_label': int(most_common_label),
+            'mean_influence': float(cluster_influences.mean()),
             'explanation_rule': explanation_rule,
             'counterfactual_rule': counterfactual_rule,
             'tree': tree,
-            'cluster_indices': cluster_indices.tolist()
+            'cluster_indices': cluster_indices.tolist(),
+            'cluster_features': cluster_features.tolist() if len(cluster_features) < 100 else None  # Store for visualization
         }
     
     def _extract_rule_from_tree(self, tree: DecisionTreeClassifier, 
                                 X: np.ndarray, target_label: int,
-                                is_explanation: bool = True) -> str:
-        """Extract a human-readable rule from decision tree."""
-        # Get tree structure
-        tree_text = export_text(tree, feature_names=self.feature_names, 
-                               max_depth=self.max_depth)
+                                is_explanation: bool = True) -> Optional[str]:
+        """Extract a human-readable rule from decision tree.
         
-        # Find paths leading to target label
+        Returns None if no valid path can be found (instead of vague rule).
+        """
+        # Find paths leading to target label using sklearn's decision_path
         paths = []
         for i in range(len(X)):
-            pred = tree.predict([X[i]])[0]
+            sample = X[i:i+1]
+            pred = tree.predict(sample)[0]
+            
             if pred == target_label:
-                # Trace path through tree
-                path = self._trace_tree_path(tree, X[i], target_label)
-                if path:
+                # Use sklearn's decision_path for accurate path tracing
+                path = self._trace_tree_path_sklearn(tree, sample[0], target_label)
+                if path and len(path) > 0:
                     paths.append(path)
         
         if not paths:
-            return f"IF (complex conditions) THEN class = {target_label}"
+            # Try alternative: find any leaf node with target_label
+            path = self._find_any_path_to_label(tree, target_label)
+            if path:
+                paths.append(path)
+        
+        if not paths:
+            # If still no paths, return None instead of vague rule
+            return None
         
         # Use most common path or simplest path
         if is_explanation:
@@ -251,46 +307,379 @@ class LocalRuleExtractor:
         
         return path_str
     
-    def _trace_tree_path(self, tree: DecisionTreeClassifier, sample: np.ndarray,
-                        target_label: int) -> Optional[List[Tuple[str, float, str]]]:
-        """Trace a path through the decision tree for a given sample."""
-        node = 0
-        path = []
+    def _trace_tree_path_sklearn(self, tree: DecisionTreeClassifier, sample: np.ndarray,
+                                 target_label: int) -> Optional[List[Tuple[str, float, str]]]:
+        """Trace a path through the decision tree using sklearn's decision_path."""
+        sample = sample.reshape(1, -1)
+        decision_path = tree.decision_path(sample)
+        node_indicator = decision_path.toarray()[0]
         
-        while True:
-            if tree.tree_.children_left[node] == tree.tree_.children_right[node]:
-                # Leaf node
-                if tree.tree_.value[node][0].argmax() == target_label:
-                    return path
-                return None
+        # Get the leaf node reached
+        leaf_id = tree.apply(sample)[0]
+        
+        # Check if leaf predicts target_label
+        leaf_value = tree.tree_.value[leaf_id][0]
+        if np.argmax(leaf_value) != target_label:
+            return None
+        
+        # Trace path from root to leaf
+        path = []
+        node_id = 0
+        
+        while node_id != leaf_id:
+            if node_indicator[node_id] == 0:
+                break
+                
+            # Check if this is a leaf
+            if tree.tree_.children_left[node_id] == tree.tree_.children_right[node_id]:
+                break
             
-            feature_idx = tree.tree_.feature[node]
-            threshold = tree.tree_.threshold[node]
+            feature_idx = tree.tree_.feature[node_id]
+            threshold = tree.tree_.threshold[node_id]
+            
+            if feature_idx < 0:  # Invalid feature index
+                break
+                
             feature_name = self.feature_names[feature_idx] if feature_idx < len(self.feature_names) else f"feature_{feature_idx}"
             
-            if sample[feature_idx] <= threshold:
+            # Determine which child to go to
+            if sample[0][feature_idx] <= threshold:
                 path.append((feature_name, threshold, "<="))
-                node = tree.tree_.children_left[node]
+                node_id = tree.tree_.children_left[node_id]
             else:
                 path.append((feature_name, threshold, ">"))
-                node = tree.tree_.children_right[node]
+                node_id = tree.tree_.children_right[node_id]
+        
+        return path if len(path) > 0 else None
+    
+    def _find_any_path_to_label(self, tree: DecisionTreeClassifier, target_label: int) -> Optional[List[Tuple[str, float, str]]]:
+        """Find any path in the tree that leads to target_label by examining leaf nodes."""
+        # Find all leaf nodes with target_label
+        leaves_with_label = []
+        for node_id in range(tree.tree_.node_count):
+            if tree.tree_.children_left[node_id] == tree.tree_.children_right[node_id]:  # Leaf node
+                leaf_value = tree.tree_.value[node_id][0]
+                if np.argmax(leaf_value) == target_label:
+                    leaves_with_label.append(node_id)
+        
+        if not leaves_with_label:
+            return None
+        
+        # Trace path from root to first matching leaf
+        target_leaf = leaves_with_label[0]
+        path = []
+        node_id = 0
+        
+        def trace_to_leaf(node_id, target_leaf, path):
+            if node_id == target_leaf:
+                return path, True
+            
+            if tree.tree_.children_left[node_id] == tree.tree_.children_right[node_id]:
+                return path, False  # Reached a leaf but not the target
+            
+            feature_idx = tree.tree_.feature[node_id]
+            threshold = tree.tree_.threshold[node_id]
+            
+            if feature_idx < 0:
+                return path, False
+            
+            feature_name = self.feature_names[feature_idx] if feature_idx < len(self.feature_names) else f"feature_{feature_idx}"
+            
+            # Try left child
+            left_path = path + [(feature_name, threshold, "<=")]
+            result_path, found = trace_to_leaf(tree.tree_.children_left[node_id], target_leaf, left_path)
+            if found:
+                return result_path, True
+            
+            # Try right child
+            right_path = path + [(feature_name, threshold, ">")]
+            result_path, found = trace_to_leaf(tree.tree_.children_right[node_id], target_leaf, right_path)
+            if found:
+                return result_path, True
+            
+            return path, False
+        
+        path, found = trace_to_leaf(node_id, target_leaf, [])
+        return path if found and len(path) > 0 else None
+    
+    def _extract_rule_from_tree_with_labels(self, tree: DecisionTreeClassifier,
+                                           X: np.ndarray, y: np.ndarray) -> Optional[str]:
+        """Extract rule using actual labels from the cluster (fallback method)."""
+        # Get unique labels in cluster
+        unique_labels = np.unique(y)
+        if len(unique_labels) == 0:
+            return None
+        
+        # Try to extract rule for the most common label
+        most_common_label = np.bincount(y).argmax()
+        
+        # Find samples with this label
+        label_mask = y == most_common_label
+        if label_mask.sum() == 0:
+            return None
+        
+        # Use first sample with this label
+        sample_idx = np.where(label_mask)[0][0]
+        sample = X[sample_idx:sample_idx+1]
+        
+        # Trace path
+        path = self._trace_tree_path_sklearn(tree, sample[0], most_common_label)
+        if path and len(path) > 0:
+            conditions = []
+            for feature_name, threshold, op in path:
+                if op == "<=":
+                    conditions.append(f"{feature_name} <= {threshold:.4f}")
+                else:
+                    conditions.append(f"{feature_name} > {threshold:.4f}")
+            return "IF " + " AND ".join(conditions) + f" THEN class = {most_common_label}"
+        
+        return None
+    
+    def _extract_rule_comprehensive(self, tree: DecisionTreeClassifier,
+                                   X: np.ndarray, y: np.ndarray, 
+                                   target_label: int) -> str:
+        """
+        Comprehensive rule extraction using multiple strategies.
+        Ensures a rule is always returned for each cluster.
+        
+        Based on techniques from "Local Rule-Based Explanations of Black Box Decision Systems"
+        
+        Strategy 1: Extract all paths to target label and use most representative
+        Strategy 2: Extract rule from tree structure directly (all leaves with target)
+        Strategy 3: Use sample-based path extraction
+        Strategy 4: Generate rule from most important features in cluster
+        """
+        # Strategy 1: Extract all paths to target label from tree structure
+        # This is the most robust method - directly extracts from tree structure
+        all_paths = self._extract_all_paths_to_label(tree, target_label)
+        if all_paths:
+            # Use the path with the most samples (most representative)
+            # This ensures we get the most common pattern in the cluster
+            best_path = max(all_paths, key=lambda p: p['n_samples'])
+            if best_path['path'] and len(best_path['path']) > 0:
+                conditions = []
+                for feature_name, threshold, op in best_path['path']:
+                    if op == "<=":
+                        conditions.append(f"{feature_name} <= {threshold:.4f}")
+                    else:
+                        conditions.append(f"{feature_name} > {threshold:.4f}")
+                return "IF " + " AND ".join(conditions) + f" THEN class = {target_label}"
+        
+        # Strategy 2: Try sample-based path extraction
+        paths = []
+        for i in range(len(X)):
+            sample = X[i:i+1]
+            pred = tree.predict(sample)[0]
+            if pred == target_label:
+                path = self._trace_tree_path_sklearn(tree, sample[0], target_label)
+                if path and len(path) > 0:
+                    paths.append(path)
+        
+        if paths:
+            # Use the first path (simplest)
+            path = paths[0]
+            conditions = []
+            for feature_name, threshold, op in path:
+                if op == "<=":
+                    conditions.append(f"{feature_name} <= {threshold:.4f}")
+                else:
+                    conditions.append(f"{feature_name} > {threshold:.4f}")
+            return "IF " + " AND ".join(conditions) + f" THEN class = {target_label}"
+        
+        # Strategy 3: Extract rule from any leaf node with target label
+        path = self._find_any_path_to_label(tree, target_label)
+        if path and len(path) > 0:
+            conditions = []
+            for feature_name, threshold, op in path:
+                if op == "<=":
+                    conditions.append(f"{feature_name} <= {threshold:.4f}")
+                else:
+                    conditions.append(f"{feature_name} > {threshold:.4f}")
+            return "IF " + " AND ".join(conditions) + f" THEN class = {target_label}"
+        
+        # Strategy 4: Generate rule from tree root to first leaf with target label
+        # This is a fallback that always works
+        rule = self._extract_rule_from_tree_structure(tree, target_label)
+        if rule:
+            return rule
+        
+        # Final fallback: Generate a simple rule based on cluster statistics
+        return self._generate_statistical_rule(X, y, target_label)
+    
+    def _extract_all_paths_to_label(self, tree: DecisionTreeClassifier, 
+                                    target_label: int) -> List[Dict]:
+        """
+        Extract all paths from root to leaves that predict target_label.
+        Returns list of paths with their sample counts.
+        Based on techniques from "Local Rule-Based Explanations of Black Box Decision Systems"
+        """
+        paths = []
+        
+        def traverse_tree(node_id, current_path):
+            """Recursively traverse tree to find all paths to target label."""
+            # Check if this is a leaf node
+            if tree.tree_.children_left[node_id] == tree.tree_.children_right[node_id]:
+                # Leaf node
+                leaf_value = tree.tree_.value[node_id][0]
+                predicted_label = np.argmax(leaf_value)
+                n_samples = int(leaf_value[predicted_label])
+                
+                if predicted_label == target_label:
+                    paths.append({
+                        'path': current_path.copy(),
+                        'n_samples': n_samples,
+                        'leaf_node': node_id
+                    })
+                return
+            
+            # Internal node - continue traversal
+            feature_idx = tree.tree_.feature[node_id]
+            threshold = tree.tree_.threshold[node_id]
+            
+            if feature_idx < 0:
+                return
+            
+            feature_name = self.feature_names[feature_idx] if feature_idx < len(self.feature_names) else f"feature_{feature_idx}"
+            
+            # Left child (<= threshold)
+            left_path = current_path + [(feature_name, threshold, "<=")]
+            traverse_tree(tree.tree_.children_left[node_id], left_path)
+            
+            # Right child (> threshold)
+            right_path = current_path + [(feature_name, threshold, ">")]
+            traverse_tree(tree.tree_.children_right[node_id], right_path)
+        
+        # Start traversal from root
+        traverse_tree(0, [])
+        return paths
+    
+    def _extract_rule_from_tree_structure(self, tree: DecisionTreeClassifier,
+                                         target_label: int) -> Optional[str]:
+        """
+        Extract rule directly from tree structure by finding the shortest path
+        to a leaf node that predicts target_label.
+        """
+        # Find all leaf nodes with target_label
+        target_leaves = []
+        for node_id in range(tree.tree_.node_count):
+            if tree.tree_.children_left[node_id] == tree.tree_.children_right[node_id]:
+                leaf_value = tree.tree_.value[node_id][0]
+                if np.argmax(leaf_value) == target_label:
+                    target_leaves.append(node_id)
+        
+        if not target_leaves:
+            return None
+        
+        # Find shortest path to first target leaf
+        target_leaf = target_leaves[0]
+        path = []
+        node_id = 0
+        
+        def find_path_to_leaf(current_node, target_leaf, current_path):
+            if current_node == target_leaf:
+                return current_path, True
+            
+            if tree.tree_.children_left[current_node] == tree.tree_.children_right[current_node]:
+                return current_path, False  # Reached a different leaf
+            
+            feature_idx = tree.tree_.feature[current_node]
+            threshold = tree.tree_.threshold[current_node]
+            
+            if feature_idx < 0:
+                return current_path, False
+            
+            feature_name = self.feature_names[feature_idx] if feature_idx < len(self.feature_names) else f"feature_{feature_idx}"
+            
+            # Try left child
+            left_path, found = find_path_to_leaf(
+                tree.tree_.children_left[current_node], 
+                target_leaf, 
+                current_path + [(feature_name, threshold, "<=")]
+            )
+            if found:
+                return left_path, True
+            
+            # Try right child
+            right_path, found = find_path_to_leaf(
+                tree.tree_.children_right[current_node],
+                target_leaf,
+                current_path + [(feature_name, threshold, ">")]
+            )
+            if found:
+                return right_path, True
+            
+            return current_path, False
+        
+        path, found = find_path_to_leaf(node_id, target_leaf, [])
+        if found and len(path) > 0:
+            conditions = []
+            for feature_name, threshold, op in path:
+                if op == "<=":
+                    conditions.append(f"{feature_name} <= {threshold:.4f}")
+                else:
+                    conditions.append(f"{feature_name} > {threshold:.4f}")
+            return "IF " + " AND ".join(conditions) + f" THEN class = {target_label}"
+        
+        return None
+    
+    def _generate_statistical_rule(self, X: np.ndarray, y: np.ndarray, 
+                                   target_label: int) -> str:
+        """
+        Generate a rule based on cluster statistics as a last resort.
+        Uses feature means and standard deviations to create a simple rule.
+        """
+        # Find samples with target label
+        label_mask = y == target_label
+        if label_mask.sum() == 0:
+            # If no samples with target label, use all samples
+            target_X = X
+        else:
+            target_X = X[label_mask]
+        
+        # Get feature means and create simple thresholds
+        feature_means = np.mean(target_X, axis=0)
+        feature_stds = np.std(target_X, axis=0)
+        
+        # Use top 3 most variable features
+        feature_variances = np.var(target_X, axis=0)
+        top_features = np.argsort(feature_variances)[-3:][::-1]
+        
+        conditions = []
+        for feat_idx in top_features:
+            if feat_idx < len(self.feature_names):
+                feature_name = self.feature_names[feat_idx]
+                mean_val = feature_means[feat_idx]
+                # Create a simple threshold rule
+                conditions.append(f"{feature_name} <= {mean_val:.4f}")
+        
+        if conditions:
+            return "IF " + " AND ".join(conditions) + f" THEN class = {target_label}"
+        else:
+            # Absolute fallback
+            return f"IF (cluster conditions) THEN class = {target_label}"
     
     def _paths_to_rule(self, paths: List[List[Tuple[str, float, str]]], 
                       target_label: int, minimal: bool = False) -> str:
-        """Convert tree paths to human-readable rule string."""
-        if not paths:
-            return f"IF (complex) THEN class = {target_label}"
+        """Convert tree paths to human-readable rule string.
+        
+        Never returns vague rules - raises error if paths are empty.
+        """
+        if not paths or len(paths) == 0:
+            raise ValueError(f"Cannot generate rule: No valid paths found for target_label {target_label}")
         
         # Use the first (simplest) path for now
         # In production, you might want to find common conditions across paths
         path = paths[0]
         
+        if not path or len(path) == 0:
+            raise ValueError(f"Cannot generate rule: Empty path for target_label {target_label}")
+        
         conditions = []
         for feature_name, threshold, op in path:
             if op == "<=":
-                conditions.append(f"{feature_name} <= {threshold:.2f}")
+                conditions.append(f"{feature_name} <= {threshold:.4f}")
             else:
-                conditions.append(f"{feature_name} > {threshold:.2f}")
+                conditions.append(f"{feature_name} > {threshold:.4f}")
         
         rule = "IF " + " AND ".join(conditions) + f" THEN class = {target_label}"
         return rule
@@ -417,4 +806,190 @@ class LocalRuleExtractor:
                 'influence_signs': cluster_data['influence_signs'].tolist()
             }
         }
+    
+    def extract_local_rules_from_csv(self, csv_path: str, test_id: int,
+                                    X_train: np.ndarray, y_train: np.ndarray,
+                                    X_test: Optional[np.ndarray] = None,
+                                    top_k: int = 50, clustering_method: str = 'kmeans') -> Dict:
+        """
+        Complete pipeline: Extract local rules for a test instance from CSV file.
+        
+        Args:
+            csv_path: Path to CSV file with columns: train_id, test_id, influence
+            test_id: Test sample ID (index in test set)
+            X_train: Training feature matrix
+            y_train: Training labels
+            X_test: Test feature matrix (optional, if None, assumes test_id is in training set)
+            top_k: Number of top influential samples
+            clustering_method: Clustering algorithm to use
+            
+        Returns:
+            Dictionary with all extracted rules and metadata
+        """
+        # Step 1: Get influential samples from CSV
+        helpful_indices, harmful_indices, helpful_infl, harmful_infl = \
+            self.get_influential_samples_from_csv(csv_path, test_id, top_k)
+        
+        # Step 2: Cluster influential samples
+        cluster_data = self.cluster_influential_samples(
+            X_train, helpful_indices, harmful_indices,
+            helpful_infl, harmful_infl, clustering_method
+        )
+        
+        # Step 3: Extract rules from each cluster
+        rules = {}
+        for cluster_id in np.unique(cluster_data['cluster_labels']):
+            if cluster_id == -1:  # Skip noise cluster from DBSCAN
+                continue
+            rules[cluster_id] = self.extract_rules_from_cluster(
+                cluster_data, cluster_id, X_train, y_train
+            )
+        
+        # Get test sample prediction
+        if X_test is not None and test_id < len(X_test):
+            test_features = X_test[test_id:test_id+1]
+        else:
+            # Fallback: assume test_id refers to training set (for backward compatibility)
+            test_features = X_train[test_id:test_id+1] if test_id < len(X_train) else None
+        
+        if test_features is None:
+            # Try to get prediction from model using a sample
+            # This shouldn't happen in normal usage
+            test_pred = np.array([0])  # Default
+        else:
+            test_pred, _ = self.get_model_predictions(test_features)
+        
+        return {
+            'test_id': test_id,
+            'test_prediction': int(test_pred[0]),
+            'helpful_samples': helpful_indices.tolist(),
+            'harmful_samples': harmful_indices.tolist(),
+            'n_clusters': len(rules),
+            'clusters': rules,
+            'cluster_data': {
+                'cluster_labels': cluster_data['cluster_labels'].tolist(),
+                'influence_signs': cluster_data['influence_signs'].tolist()
+            }
+        }
 
+
+    def visualize_decision_tree(self, tree: DecisionTreeClassifier, cluster_id: int,
+                                feature_names: Optional[List[str]] = None,
+                                max_depth: int = None, figsize=(20, 10)):
+        """Visualize the decision tree for a cluster.
+        
+        Args:
+            tree: Fitted DecisionTreeClassifier
+            cluster_id: ID of the cluster
+            feature_names: List of feature names (uses self.feature_names if None)
+            max_depth: Maximum depth to show (uses tree.max_depth if None)
+            figsize: Figure size tuple
+        """
+        if feature_names is None:
+            feature_names = self.feature_names
+        
+        if max_depth is None:
+            max_depth = tree.max_depth if hasattr(tree, 'max_depth') else 5
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        plot_tree(tree, feature_names=feature_names, 
+                 class_names=[f"Class {i}" for i in range(tree.n_classes_)],
+                 filled=True, rounded=True, fontsize=10, max_depth=max_depth, ax=ax)
+        ax.set_title(f"Decision Tree for Cluster {cluster_id}", fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        return fig
+    
+    def visualize_sample_path(self, tree: DecisionTreeClassifier, sample: np.ndarray,
+                              sample_label: int, cluster_id: int,
+                              feature_names: Optional[List[str]] = None):
+        """Visualize the path a sample takes through the decision tree.
+        
+        Args:
+            tree: Fitted DecisionTreeClassifier
+            sample: Single sample (1D array)
+            sample_label: True label of the sample
+            cluster_id: ID of the cluster
+            feature_names: List of feature names (uses self.feature_names if None)
+        
+        Returns:
+            Dictionary with path information and visualization
+        """
+        if feature_names is None:
+            feature_names = self.feature_names
+        
+        sample = sample.reshape(1, -1)
+        prediction = tree.predict(sample)[0]
+        decision_path = tree.decision_path(sample)
+        node_indicator = decision_path.toarray()[0]
+        
+        # Get path nodes
+        path_nodes = np.where(node_indicator == 1)[0]
+        leaf_node = tree.apply(sample)[0]
+        
+        # Extract path conditions
+        path_conditions = []
+        for node_id in path_nodes:
+            if node_id == leaf_node:
+                break
+            if tree.tree_.children_left[node_id] != tree.tree_.children_right[node_id]:  # Not a leaf
+                feature_idx = tree.tree_.feature[node_id]
+                threshold = tree.tree_.threshold[node_id]
+                if feature_idx >= 0:
+                    feature_name = feature_names[feature_idx] if feature_idx < len(feature_names) else f"feature_{feature_idx}"
+                    sample_value = sample[0][feature_idx]
+                    if sample_value <= threshold:
+                        path_conditions.append({
+                            'node': node_id,
+                            'feature': feature_name,
+                            'threshold': threshold,
+                            'sample_value': sample_value,
+                            'condition': f"{feature_name} <= {threshold:.4f}",
+                            'direction': 'left'
+                        })
+                    else:
+                        path_conditions.append({
+                            'node': node_id,
+                            'feature': feature_name,
+                            'threshold': threshold,
+                            'sample_value': sample_value,
+                            'condition': f"{feature_name} > {threshold:.4f}",
+                            'direction': 'right'
+                        })
+        
+        # Get leaf node info
+        leaf_value = tree.tree_.value[leaf_node][0]
+        leaf_class = np.argmax(leaf_value)
+        leaf_samples = int(leaf_value[leaf_class])
+        
+        return {
+            'cluster_id': cluster_id,
+            'sample': sample[0].tolist(),
+            'true_label': int(sample_label),
+            'predicted_label': int(prediction),
+            'leaf_node': int(leaf_node),
+            'path_nodes': path_nodes.tolist(),
+            'path_conditions': path_conditions,
+            'leaf_class': int(leaf_class),
+            'leaf_samples': int(leaf_samples),
+            'path_string': " → ".join([c['condition'] for c in path_conditions]) + f" → Class {leaf_class}"
+        }
+    
+    def print_tree_text(self, tree: DecisionTreeClassifier, 
+                       feature_names: Optional[List[str]] = None,
+                       max_depth: int = None):
+        """Print the decision tree in text format.
+        
+        Args:
+            tree: Fitted DecisionTreeClassifier
+            feature_names: List of feature names (uses self.feature_names if None)
+            max_depth: Maximum depth to show
+        """
+        if feature_names is None:
+            feature_names = self.feature_names
+        
+        if max_depth is None:
+            max_depth = tree.max_depth if hasattr(tree, 'max_depth') else 10
+        
+        tree_text = export_text(tree, feature_names=feature_names, max_depth=max_depth)
+        print(tree_text)
+        return tree_text

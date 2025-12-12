@@ -51,8 +51,15 @@ def s_test(z_test, t_test, model, z_loader, device=-1, damp=0.01, scale=25.0,
         except StopIteration:
             z_loader_iter = iter(z_loader)
             x, t = next(z_loader_iter)
-        if device >= 0:
-            x, t = x.cuda(), t.cuda()
+        # Handle both int and torch.device objects
+        if isinstance(device, torch.device):
+            device_id = 0 if device.type == 'cuda' else -1
+            target_device = device
+        else:
+            device_id = device
+            target_device = torch.device('cuda:0' if device >= 0 else 'cpu')
+        if device_id >= 0:
+            x, t = x.to(target_device), t.to(target_device)
         # if torch.isnan(x).any() or torch.isinf(x).any():
         #     print(f"x has nans/infs")
         # if torch.isnan(t).any() or torch.isinf(t).any():
@@ -121,15 +128,23 @@ def grad_z(z, t, model, device=-1):
             e.g. an image sample (batch_size, 3, 256, 256)
         t: torch tensor, training data labels
         model: torch NN, model used to evaluate the dataset
-        device: int, device id to use for GPU, -1 for CPU
+        device: int or torch.device, device id to use for GPU (-1 for CPU) or torch.device object
 
     Returns:
         grad_z: list of torch tensor, containing the gradients
             from model parameters to loss"""
     model.eval()
     # initialize
-    if device >= 0:
-        z, t = z.cuda(), t.cuda()
+    # Handle both int and torch.device objects
+    if isinstance(device, torch.device):
+        device_id = 0 if device.type == 'cuda' else -1
+        target_device = device
+    else:
+        device_id = device
+        target_device = torch.device('cuda:0' if device >= 0 else 'cpu')
+    
+    if device_id >= 0:
+        z, t = z.to(target_device), t.to(target_device)
     y = model(z)
     loss = calc_loss(y, t)
     # Compute sum of gradients from model parameters to loss

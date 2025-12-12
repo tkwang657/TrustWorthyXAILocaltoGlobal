@@ -35,12 +35,23 @@ def _to_scalar(x):
 def compute_s_test_vector_for_point(model, z_test, t_test, train_loader, device=-1,
                        damp=0.01, scale=25, recursion_depth=5000, r=1, eps=2e-4, patience=None):
     """Compute s_test (inverse-HVP * grad) for one test point."""
-    model.to(torch.device('cpu') if device == -1 else torch.device(f'cuda:0'))
+    # Normalize device to handle both int and torch.device objects
+    if isinstance(device, torch.device):
+        device_id = 0 if device.type == 'cuda' else -1
+        target_device = device
+    else:
+        device_id = device
+        target_device = torch.device('cuda:0' if device >= 0 else 'cpu')
+    
+    model.to(target_device)
     s_vec_list=[]
     for i in range(r):
-        s_vec=s_test(z_test=z_test, t_test=t_test, model=model, z_loader=train_loader, device=device, damp=damp, scale=scale, recursion_depth=recursion_depth, eps=eps, patience=patience)
+        # Pass device_id (int) to s_test, not the device object
+        s_vec=s_test(z_test=z_test, t_test=t_test, model=model, z_loader=train_loader, 
+                    device=device_id, damp=damp, scale=scale, recursion_depth=recursion_depth, 
+                    eps=eps, patience=patience)
 
-        s_flat = torch.cat([s.flatten() for s in s_vec]).to(device)
+        s_flat = torch.cat([s.flatten() for s in s_vec]).to(target_device)
         s_vec_list.append(s_flat)
         display_progress("Averaging r-times: ", i, r)
     s_avg = torch.stack(s_vec_list).mean(dim=0)
@@ -110,6 +121,15 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
     
     devicename=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     device=config['device']
+    
+    # Normalize device to handle both int and torch.device objects
+    if isinstance(device, torch.device):
+        device_id = 0 if device.type == 'cuda' else -1
+        target_device = device
+    else:
+        device_id = device
+        target_device = torch.device('cuda:0' if device >= 0 else 'cpu')
+    
     starttime=datetime.datetime.now()
     computed_pairs = set()
     if outfile.exists():
@@ -130,10 +150,10 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
             grads_flat_batch = []
             for train_idx in batch_indices:
                 z_train, t_train = train_loader.dataset[train_idx]
-                z_train = train_loader.collate_fn([z_train]).to(device)
-                t_train = train_loader.collate_fn([t_train]).to(device)
-                grad_vec = grad_z(z_train, t_train, model, device=device)
-                grad_flat = torch.cat([g.flatten() for g in grad_vec]).to(device)
+                z_train = train_loader.collate_fn([z_train]).to(target_device)
+                t_train = train_loader.collate_fn([t_train]).to(target_device)
+                grad_vec = grad_z(z_train, t_train, model, device=device_id)
+                grad_flat = torch.cat([g.flatten() for g in grad_vec]).to(target_device)
                 grads_flat_batch.append(grad_flat)
                 
             # Stack batch into matrix [batch_size x num_params]
@@ -150,7 +170,7 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
                     s_path = os.path.join(cachedir, f"s_test_{test_idx}.pt")
                     assert os.path.isfile(s_path), f"File path given: {s_path}"
                     s_vec = torch.load(s_path, map_location=devicename)
-                    s_vec_flat = torch.cat([p.flatten() for p in s_vec]).to(device)  # shape: (num_params,)
+                    s_vec_flat = torch.cat([p.flatten() for p in s_vec]).to(target_device)  # shape: (num_params,)
                     svec_cache[test_idx]=s_vec_flat
                 # Vectorized influence calculation: - grads @ s_test / n_train
                 influence_vals = -(grads_batch @ s_vec_flat) / n_train  # shape: (batch,)
