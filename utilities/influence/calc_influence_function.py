@@ -3,7 +3,7 @@
 Lightweight influence functions for tabular Torch models (e.g., TabNet).
 Designed for small/medium datasets (computes influences on the fly).
 """
-
+import pandas as pd
 import os
 import sys
 import time
@@ -130,15 +130,13 @@ def load_stest_and_compute_batch_influence(model, train_loader, test_loader, tes
         device_id = device
         target_device = torch.device('cuda:0' if device >= 0 else 'cpu')
     
+    
     starttime=datetime.datetime.now()
     computed_pairs = set()
     if outfile.exists():
-        with open(outfile, "r") as f:
-            reader = csv.reader(f)
-            next(reader)  # skip header
-            for row in reader:
-                train_id, test_id, _ = row
-                computed_pairs.add((int(train_id), int(test_id)))
+        df = pd.read_csv(outfile, skiprows=1, header=None, names=['train_id', 'test_id', '_'])
+        computed_pairs = set(zip(df['train_id'].astype(int), df['test_id'].astype(int)))
+        print(f"Already computed {len(computed_pairs)} pairs.")
     with open(outfile, "w") as f:
         f.write("train_id,test_id,influence\n")
         for start_idx in range(0, n_train, batchsize):
