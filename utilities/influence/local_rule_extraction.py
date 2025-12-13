@@ -29,7 +29,7 @@ class LocalRuleExtractor:
     """
     
     def __init__(self, model, feature_names: List[str], n_clusters: int = 3, 
-                 max_depth: int = 5, min_samples_split: int = 10, device='cpu'):
+                 max_depth: int = 5, min_samples_split: int = 10, categorical_indices=[], device='cpu'):
         """
         Args:
             model: Trained TabNet model (wrapped with TabNetWrapper)
