@@ -37,6 +37,7 @@ class LocalRuleExtractor:
             n_clusters: Number of clusters for influential samples
             max_depth: Maximum depth for decision trees
             min_samples_split: Minimum samples to split a node
+            categorical_indices: List of indices for categorical features (to preserve categorical nature)
         """
         self.device=device
         self.model= model.to(device)
@@ -44,6 +45,7 @@ class LocalRuleExtractor:
         self.n_clusters = n_clusters
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
+        self.categorical_indices = categorical_indices if categorical_indices is not None else []
         self.model.eval()
     
     def get_influential_samples_from_csv(self, csv_path: str, test_id: int,
@@ -159,29 +161,68 @@ class LocalRuleExtractor:
         influence_signs = np.concatenate([np.ones(len(helpful_indices)), 
                                          -np.ones(len(harmful_indices))])
         
-        # Create clustering features: combine normalized features, logits, and influence
-        scaler = StandardScaler()
-        features_scaled = scaler.fit_transform(all_features)
+        # Separate categorical and continuous features
+        n_samples, n_features = all_features.shape
+        categorical_mask = np.array([i in self.categorical_indices for i in range(n_features)])
+        continuous_mask = ~categorical_mask
+        
+        # Handle categorical features: use mode-based clustering or distance metric
+        # For categorical features, we'll use a distance-based approach that preserves categorical nature
+        categorical_features = all_features[:, categorical_mask] if categorical_mask.any() else None
+        continuous_features = all_features[:, continuous_mask] if continuous_mask.any() else None
+        
+        # Prepare clustering features
+        clustering_parts = []
+        
+        # Continuous features: standardize
+        if continuous_features is not None and continuous_features.shape[1] > 0:
+            scaler = StandardScaler()
+            continuous_scaled = scaler.fit_transform(continuous_features)
+            clustering_parts.append(continuous_scaled)
+        else:
+            scaler = None
+        
+        # Categorical features: use one-hot encoding or mode-based distance
+        # For now, we'll use a simple approach: treat categorical as ordinal but use mode for cluster centers
+        if categorical_features is not None and categorical_features.shape[1] > 0:
+            # For categorical, we can use a distance metric that works with integers
+            # Or use mode-based clustering. For simplicity, we'll scale them differently
+            # Use min-max scaling to [0, 1] range to preserve relative distances
+            from sklearn.preprocessing import MinMaxScaler
+            cat_scaler = MinMaxScaler()
+            categorical_scaled = cat_scaler.fit_transform(categorical_features)
+            clustering_parts.append(categorical_scaled)
+        else:
+            cat_scaler = None
+        
+        # Add logits, influences, and influence signs (these are always continuous)
         logits_scaled = StandardScaler().fit_transform(all_logits)
         influences_scaled = StandardScaler().fit_transform(all_influences.reshape(-1, 1))
         
-        # Combine features for clustering
-        clustering_features = np.hstack([
-            features_scaled,
-            logits_scaled,
-            influences_scaled,
-            influence_signs.reshape(-1, 1)
-        ])
+        clustering_parts.extend([logits_scaled, influences_scaled, influence_signs.reshape(-1, 1)])
+        
+        # Combine all features for clustering
+        clustering_features = np.hstack(clustering_parts) if len(clustering_parts) > 1 else clustering_parts[0]
         
         # Perform clustering
+        # For mixed data, we can still use kmeans but with better initialization
+        # Alternatively, use a method that handles mixed data better
         if clustering_method == 'kmeans':
-            clusterer = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
+            # Use kmeans with k-means++ initialization (works better for mixed data)
+            clusterer = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10, init='k-means++')
             cluster_labels = clusterer.fit_predict(clustering_features)
         elif clustering_method == 'dbscan':
             clusterer = DBSCAN(eps=0.5, min_samples=5)
             cluster_labels = clusterer.fit_predict(clustering_features)
+        elif clustering_method == 'mode':
+            # Mode-based clustering for categorical data
+            # Cluster based on mode of categorical features + kmeans for continuous
+            cluster_labels = self._mode_based_clustering(
+                all_features, categorical_mask, self.n_clusters
+            )
+            clusterer = None  # Mode-based doesn't return a clusterer object
         else:
-            raise ValueError(f"Unknown clustering method: {clustering_method}")
+            raise ValueError(f"Unknown clustering method: {clustering_method}. Use 'kmeans', 'dbscan', or 'mode'")
         
         return {
             'cluster_labels': cluster_labels,
@@ -192,8 +233,101 @@ class LocalRuleExtractor:
             'indices': all_indices,
             'influence_signs': influence_signs,
             'scaler': scaler,
-            'clusterer': clusterer
+            'cat_scaler': cat_scaler,
+            'clusterer': clusterer,
+            'categorical_mask': categorical_mask
         }
+    
+    def _mode_based_clustering(self, features: np.ndarray, categorical_mask: np.ndarray, 
+                               n_clusters: int) -> np.ndarray:
+        """
+        Mode-based clustering for mixed categorical/continuous data.
+        
+        For categorical features, uses mode (most common value) per cluster.
+        For continuous features, uses kmeans.
+        """
+        n_samples = features.shape[0]
+        
+        # If we have categorical features, use them for initial clustering
+        if categorical_mask.any():
+            categorical_features = features[:, categorical_mask]
+            
+            # Group samples by their categorical feature combinations
+            # Create a hash for each sample's categorical values
+            cat_hashes = []
+            for i in range(n_samples):
+                cat_hash = hash(tuple(categorical_features[i].astype(int)))
+                cat_hashes.append(cat_hash)
+            
+            # Find unique categorical patterns
+            unique_patterns = {}
+            for i, cat_hash in enumerate(cat_hashes):
+                if cat_hash not in unique_patterns:
+                    unique_patterns[cat_hash] = []
+                unique_patterns[cat_hash].append(i)
+            
+            # Use categorical patterns for initial clustering
+            cluster_labels = np.zeros(n_samples, dtype=int)
+            
+            if len(unique_patterns) <= n_clusters:
+                # Fewer patterns than clusters: assign each pattern to a cluster
+                for cluster_id, (pattern_hash, indices) in enumerate(unique_patterns.items()):
+                    for idx in indices:
+                        cluster_labels[idx] = cluster_id
+                
+                # If we have fewer patterns than desired clusters, split larger clusters
+                if len(unique_patterns) < n_clusters:
+                    # Use continuous features to further split clusters
+                    continuous_features = features[:, ~categorical_mask] if (~categorical_mask).any() else None
+                    if continuous_features is not None and continuous_features.shape[1] > 0:
+                        # Refine clusters using continuous features
+                        from sklearn.cluster import KMeans
+                        next_cluster_id = len(unique_patterns)
+                        for pattern_id in range(len(unique_patterns)):
+                            pattern_mask = cluster_labels == pattern_id
+                            if pattern_mask.sum() > 1 and next_cluster_id < n_clusters:
+                                # Split this cluster using continuous features
+                                sub_features = continuous_features[pattern_mask]
+                                n_sub_clusters = min(n_clusters - next_cluster_id + 1, len(sub_features), pattern_mask.sum())
+                                if n_sub_clusters > 1:
+                                    sub_kmeans = KMeans(n_clusters=n_sub_clusters, 
+                                                       random_state=42, n_init=10)
+                                    sub_labels = sub_kmeans.fit_predict(sub_features)
+                                    # Update cluster labels
+                                    for idx, sub_label in zip(np.where(pattern_mask)[0], sub_labels):
+                                        cluster_labels[idx] = next_cluster_id + sub_label - 1
+                                    next_cluster_id += n_sub_clusters
+            else:
+                # More patterns than clusters: group similar patterns
+                # Create pattern representatives (one sample per pattern)
+                pattern_reps = []
+                pattern_to_idx = {}
+                for pattern_idx, (pattern_hash, indices) in enumerate(unique_patterns.items()):
+                    # Use first sample of each pattern as representative
+                    pattern_reps.append(categorical_features[indices[0]])
+                    pattern_to_idx[pattern_hash] = pattern_idx
+                
+                # Cluster patterns using kmeans
+                from sklearn.cluster import KMeans
+                pattern_reps_array = np.array(pattern_reps)
+                cat_kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+                pattern_cluster_map = cat_kmeans.fit_predict(pattern_reps_array)
+                
+                # Create mapping from pattern hash to cluster
+                pattern_hash_to_cluster = {}
+                for pattern_hash, pattern_idx in pattern_to_idx.items():
+                    pattern_hash_to_cluster[pattern_hash] = pattern_cluster_map[pattern_idx]
+                
+                # Assign samples to clusters based on their pattern's cluster
+                for i, cat_hash in enumerate(cat_hashes):
+                    cluster_labels[i] = pattern_hash_to_cluster[cat_hash]
+            
+            return cluster_labels
+        
+        # Fallback to kmeans on all features
+        from sklearn.cluster import KMeans
+        clusterer = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        return clusterer.fit_predict(features)
     
     def extract_rules_from_cluster(self, cluster_data: Dict, cluster_id: int,
                                    X_train: np.ndarray, y_train: np.ndarray) -> Dict:
