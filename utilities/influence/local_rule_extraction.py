@@ -29,7 +29,7 @@ class LocalRuleExtractor:
     """
     
     def __init__(self, model, feature_names: List[str], n_clusters: int = 3, 
-                 max_depth: int = 5, min_samples_split: int = 10):
+                 max_depth: int = 5, min_samples_split: int = 10, device='cpu'):
         """
         Args:
             model: Trained TabNet model (wrapped with TabNetWrapper)
@@ -38,7 +38,8 @@ class LocalRuleExtractor:
             max_depth: Maximum depth for decision trees
             min_samples_split: Minimum samples to split a node
         """
-        self.model = model
+        self.device=device
+        self.model= model.to(device)
         self.feature_names = feature_names
         self.n_clusters = n_clusters
         self.max_depth = max_depth
@@ -61,10 +62,8 @@ class LocalRuleExtractor:
             helpful_influences: Influence values for helpful samples
             harmful_influences: Influence values for harmful samples
         """
-        # Load CSV
         df = pd.read_csv(csv_path)
         
-        # Filter for this test_id
         test_df = df[df['test_id'] == test_id].copy()
         
         if len(test_df) == 0:
@@ -72,8 +71,6 @@ class LocalRuleExtractor:
         
         # Sort by influence and get top helpful (positive) and harmful (negative)
         test_df = test_df.sort_values('influence', ascending=False)
-        
-        # Get helpful (positive influence) and harmful (negative influence)
         helpful_df = test_df[test_df['influence'] > 0].head(top_k)
         harmful_df = test_df[test_df['influence'] < 0].tail(top_k)
         
@@ -87,10 +84,8 @@ class LocalRuleExtractor:
     def get_influential_samples(self, influence_results: Dict, test_id: int, 
                                 top_k: int = 50) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Step 1: Identify influential training samples.
-        
         Args:
-            influence_results: Results from calc_influence_dataset
+            influence_results: Dictionary with influence results
             test_id: Test sample ID
             top_k: Number of top helpful/harmful samples to consider
             
@@ -122,7 +117,7 @@ class LocalRuleExtractor:
             logits: Raw model outputs (before softmax)
         """
         with torch.no_grad():
-            X_tensor = torch.tensor(X, dtype=torch.float32)
+            X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
             logits = self.model(X_tensor).numpy()
             predictions = np.argmax(logits, axis=1)
         
@@ -412,6 +407,7 @@ class LocalRuleExtractor:
         
         # Try to extract rule for the most common label
         most_common_label = np.bincount(y).argmax()
+        print(f"The dominant label is : {most_common_label}")
         
         # Find samples with this label
         label_mask = y == most_common_label
